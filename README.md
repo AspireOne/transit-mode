@@ -4,7 +4,7 @@ A Windows power-mode switch for when your laptop needs to keep working while clo
 
 It's especially useful for background work - a coding agent, build, test suite, download, or long-running script. No more half-opened lids just to ensure Claude keeps working - enable transit mode and take it To-Go (don't forget to connect your laptop to mobile data though).
 
-Transit Mode lowers CPU power demand, disables CPU boost, keeps the machine awake with the lid closed, and crucially, watches the CPU temperature using an independent watchdog (which works like a cockroach - try to cut it's head, and it'll just grow another - it just won't fail). If the temperature stays too high, the watchdog hibernates the laptop automatically.
+Transit Mode lowers CPU power demand, disables CPU boost, keeps the machine awake with the lid closed, and crucially, watches the CPU temperature using an independent watchdog. If the temperature stays too high, the watchdog hibernates the laptop automatically.
 
 It is deliberately boring. It changes a temporary Windows power plan, watches the machine, and 100% restores what it found when you are done.
 
@@ -14,10 +14,15 @@ Open an elevated PowerShell window in this directory:
 
 ```powershell
 .\transit-mode.ps1 diagnose
+```
+
+The first run verifies or installs the sensor dependencies and may ask for administrator approval. You can only run it once and then you're good to go.
+
+```
 .\transit-mode.ps1 on
 ```
 
-The first run verifies or installs the sensor dependencies and may ask for administrator approval. Keep the laptop ventilated, do not charge it inside a bag, and do not place it on soft material that blocks airflow.
+Enable transit mode. Remember: it deliberately lowers power usage of the laptop and watches temps, so that even in an encapsulated bag, it doesn't get too hot. However, if possible, prefer to keep it ventilated and not on AC (powerbank etc.).
 
 When you are back:
 
