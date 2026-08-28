@@ -56,23 +56,6 @@ C:\ProgramData\TransitMode\thermal-YYYY-MM-DD.csv
 
 The sensor driver remains installed because it is a shared dependency. Transit Mode does not change Lenovo Vantage profiles, RyzenAdj firmware limits, or GPU and battery temperature controls.
 
-## Benchmark
-
-`codex-benchmark.sh` runs a repeatable approximation of a real frontend coding session in WSL. It starts a disposable dev server, edits and requests code, waits between tasks, runs ESLint, tests, and project checks, then records timings.
-
-```bash
-./codex-benchmark.sh normal
-./codex-benchmark.sh transit
-```
-
-The default run lasts 15 minutes. Pass a number for a shorter experiment, in minutes:
-
-```bash
-./codex-benchmark.sh normal 2
-```
-
-Results are written to `benchmark-results/`. The benchmark verifies the requested mode before starting and never modifies the live frontend checkout.
-
 ## Requirements
 
 - Windows 11 with PowerShell 5
