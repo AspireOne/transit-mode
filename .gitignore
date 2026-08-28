@@ -3,6 +3,7 @@
 /codex-benchmark.sh
 /BENCHMARK.md
 /benchmark-results/
+.local/
 
 # Local editor and operating-system files.
 .vscode/
