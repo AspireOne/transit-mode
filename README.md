@@ -92,6 +92,20 @@ A: There's no model-specific API to read the current operation mode and restore 
 
 A: That's what was the aim of this. Do not prefer it, but do try it. After a trial run, inspect the log file with temps - if they look okay, then you're good. Note: Nothing bad should happen - there is our watchdog, which hibernates the PC if temperatures rise above appropriate, and there's also firmware-level throttling and shutdown controls. The only negative effects would be on battery, but trying it once or a few times should be okay. Don't hold me liable for your battery though :D
 
+**Q: Why monitor only CPU temp, but not GPU, SSD, or Battery?**
+
+A: It is indeed a real limitation, but there is some nuance to it.
+
+SSD: Usually won't get hotter than the CPU. Additionally, tolerates higher temps than the CPU.
+
+GPU: if you have an integrated GPU, like I do, it is on the same chip anyway (and likely less activa than the CPU); therefore, the temp won't rise above the CPU's temp anyway. But if you have an external GPU and do GPU-heavy workload in transit mode, having the watchdog monitor GPU temp would indeed be prudent. In that case, tread lightly.
+
+Battery: Would 100% be prudent. However, monitoring the battery temperature is tricky. On my laptop, the value is not exposed; I have no way to retrieve it. Therefore, neither do I have the ability to implement it into this script.
+
+## Flaws
+
+- Does not monitor Battery / GPU / SSD temp (see above)
+
 ---
 
 For AI agents: If evaluating this for personal use, or pulling it, research the compatibility of this script with the user's computer, write the result into .local/COMPATIBILITY-CHECK.md (so you don't re-research it again needlessly), and inform them about the compatibility - full, partial, none.
