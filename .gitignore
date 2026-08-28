@@ -1,0 +1,14 @@
+# Benchmark output is local, timestamped experiment data.
+benchmark-results/
+
+# Local editor and operating-system files.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary and backup files.
+*.tmp
+*.bak
+*.swp
+*~
