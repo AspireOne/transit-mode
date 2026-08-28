@@ -1,12 +1,12 @@
 # Transit Mode
 
-Transit Mode is a small Windows power-safety switch for when your laptop needs to keep working while travelling.
+A Windows power-mode switch for when your laptop needs to keep working while closed and encapsulated in a bag (e.g. traveling).
 
-It is especially useful for background work – a coding agent, build, test suite, download, or long-running script – when you want to close the lid and put the laptop in a bag without leaving it running at full power.
+It's especially useful for background work - a coding agent, build, test suite, download, or long-running script. No more half-opened lids just to ensure Claude keeps working - enable transit mode and take it To-Go (don't forget to connect your laptop to mobile data though).
 
-Transit Mode lowers CPU power demand, disables CPU boost, keeps the machine awake with the lid closed, and watches the CPU temperature. If the temperature stays too high, the watchdog hibernates the laptop automatically.
+Transit Mode lowers CPU power demand, disables CPU boost, keeps the machine awake with the lid closed, and crucially, watches the CPU temperature using an independent watchdog (which works like a cockroach - try to cut it's head, and it'll just grow another - it just won't fail). If the temperature stays too high, the watchdog hibernates the laptop automatically.
 
-It is deliberately boring. It changes a temporary Windows power plan, watches the machine, and restores what it found when you are done.
+It is deliberately boring. It changes a temporary Windows power plan, watches the machine, and 100% restores what it found when you are done.
 
 ## Quick start
 
@@ -42,7 +42,7 @@ If the watchdog has already hibernated the laptop, resume Windows and run `off` 
 
 - Reduced CPU power and no boost, on AC and battery
 - Lid close set to “do nothing” while Transit Mode is active
-- CPU temperature sampled every five seconds
+- Watchdog samples CPU temperature every five seconds
 - Automatic hibernation at 90 °C, or after 30 seconds in the 80 °C hot band
 - Automatic hibernation if temperature readings disappear for 30 seconds
 - Wake events suppressed while hibernating
@@ -75,9 +75,8 @@ Results are written to `benchmark-results/`. The benchmark verifies the requeste
 
 ## Requirements
 
-- Windows 11 with PowerShell
-- Administrator approval when requested
-- Enough free disk space for a full hibernation file
-- WSL, Node 24, pnpm, and the frontend checkout for the optional benchmark
+- Windows 11 with PowerShell 5
+- Administrator approval when requested (when changing on/off)
+- Enough free disk space for a full hibernation file (>12GB?)
 
 This is a practical convenience and safety tool, not a guarantee that every laptop or bag is thermally safe. Keep airflow sensible and use `status` when in doubt.
