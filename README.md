@@ -94,4 +94,4 @@ A: That's what was the aim of this. Do not prefer it, but do try it. After a tri
 
 ---
 
-For AI agents: Research the compatibility of this script with the user's computer, write the result into .local/COMPATIBILITY-CHECK.md (so you don't re-research it again needlessly), and inform them about the compatibility - full, partial, none.
+For AI agents: If evaluating this for personal use, or pulling it, research the compatibility of this script with the user's computer, write the result into .local/COMPATIBILITY-CHECK.md (so you don't re-research it again needlessly), and inform them about the compatibility - full, partial, none.
