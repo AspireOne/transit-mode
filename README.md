@@ -8,6 +8,21 @@ Transit Mode lowers CPU power demand, disables CPU boost, keeps the machine awak
 
 It is deliberately boring. It changes a temporary Windows power plan, watches the machine, and 100% restores what it found when you are done.
 
+## Compatibility and requirements
+
+Transit Mode runs on **64-bit Windows 10 or 11** with the built-in Windows PowerShell 5.1 (the script re-launches itself if started from PowerShell 7). It is tested on one machine: Lenovo IdeaPad Slim 5 15ARP10 (Ryzen 7 7735HS), Windows 11.
+
+- **Administrator approval** is required once per `on`/`off` for power-plan changes, hibernation, the scheduled watchdog task, and the sensor driver.
+- **Hibernation must be supported by the firmware.** `on` enables it when disabled and verifies it afterwards; on machines without S4 it fails with a clear error before changing anything.
+- **Enough free space on the system drive for a full hibernation file** — about 40% of installed RAM. `on` checks this up front.
+- **The watchdog needs the signed PawnIO kernel driver.** LibreHardwareMonitor reads CPU temperatures through it on both AMD and Intel CPUs; Memory Integrity (HVCI) does not block it. `on` installs it only after verifying its SHA-256 and Authenticode signature, and `diagnose` confirms a live temperature reading before use.
+- **On Modern Standby (S0) laptops**, "lid close → do nothing" is honored, but the system can still drop into S0 low-power idle when the workload goes quiet, which throttles background work. Transit Mode does not hold a Windows execution request; it relies on the running work itself keeping the machine busy. This holds on the tested machine; on other S0 laptops, verify with `status` and a short test run first.
+- **OEM power managers** (Lenovo Vantage Fn+Q, MyASUS, manufacturer utilities) may override the temporary plan's settings. Transit Mode does not change them.
+
+Untested: Intel CPUs, ARM64, Windows 10, and non-Lenovo firmware behavior.
+
+This is a practical convenience and safety tool, not a guarantee that every laptop or bag is thermally safe. Keep airflow sensible and use `status` when in doubt.
+
 ## Quick start
 
 Open an elevated PowerShell window in this directory:
@@ -60,11 +75,3 @@ C:\ProgramData\TransitMode\thermal-YYYY-MM-DD.csv
 ```
 
 The sensor driver remains installed because it is a shared dependency. Transit Mode does not change Lenovo Vantage profiles, RyzenAdj firmware limits, or GPU and battery temperature controls.
-
-## Requirements
-
-- Windows 11 with PowerShell 5
-- Administrator approval when requested (when changing on/off)
-- Enough free disk space for a full hibernation file (>12GB?)
-
-This is a practical convenience and safety tool, not a guarantee that every laptop or bag is thermally safe. Keep airflow sensible and use `status` when in doubt.
