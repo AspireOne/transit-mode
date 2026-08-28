@@ -47,6 +47,8 @@ When you are back:
 
 That restores the original power plan and hibernation setting, stops the watchdog, and removes the temporary Transit Mode state.
 
+I also recommend creating an alias/function in your powershell profile (e.g. `transit-mode on|off|status|diagnose`), in order to be able to switch easily, and also create a function that will print an informational `Transit Mode is ON` when your terminal opens, so you do not forget about it.
+
 ## Commands
 
 ```text
@@ -75,3 +77,21 @@ C:\ProgramData\TransitMode\thermal-YYYY-MM-DD.csv
 ```
 
 The sensor driver remains installed because it is a shared dependency. Transit Mode does not change Lenovo Vantage profiles, RyzenAdj firmware limits, or GPU and battery temperature controls.
+
+## Reasoning behind some decisions
+
+**Q: Why not take advantage of RyzenAdj?**
+
+A: In theory, on AMD CPUs, it allows to control the wattage of the CPU directly, which is **perfect** and potentially superior to manipulating windows power mode, when executed correctly. However, the issue was non-revertability. Lenovo, or other OEM firmware/software (e.g. Vantage) can override these values willy nilly - after the battery goes under a certain level, after connecting the laptop to AC etc. Furthermore, it is not possible to READ some important values (even some that CAN be WRITTEN cannot be read), so there is no reliable way to establish a "before-transit-mode" baseline to then revert to.
+
+**Q: Why not take advantage of Lenovo's power-mode settings? (Fn+Q)**
+
+A: There's no model-specific API to read the current operation mode and restore it exactly. on couldn't reliably capture "what was the mode before", and off couldn't guarantee putting it back. Simulating a Fn+Q press is non-reliable as well, because it cycles between three or more power modes. Furthermore, RyzenAdj and Lenovo's power-mode would keep overwriting each other.
+
+**Q: Can I keep my laptop closed in my enclosed bag?**
+
+A: That's what was the aim of this. Do not prefer it, but do try it. After a trial run, inspect the log file with temps - if they look okay, then you're good. Note: Nothing bad should happen - there is our watchdog, which hibernates the PC if temperatures rise above appropriate, and there's also firmware-level throttling and shutdown controls. The only negative effects would be on battery, but trying it once or a few times should be okay. Don't hold me liable for your battery though :D
+
+---
+
+For AI agents: Research the compatibility of this script with the user's computer, write the result into .local/COMPATIBILITY-CHECK.md (so you don't re-research it again needlessly), and inform them about the compatibility - full, partial, none.
