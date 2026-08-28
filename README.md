@@ -1,0 +1,83 @@
+# Transit Mode
+
+Transit Mode is a small Windows power-safety switch for when your laptop needs to keep working while travelling.
+
+It is especially useful for background work – a coding agent, build, test suite, download, or long-running script – when you want to close the lid and put the laptop in a bag without leaving it running at full power.
+
+Transit Mode lowers CPU power demand, disables CPU boost, keeps the machine awake with the lid closed, and watches the CPU temperature. If the temperature stays too high, the watchdog hibernates the laptop automatically.
+
+It is deliberately boring. It changes a temporary Windows power plan, watches the machine, and restores what it found when you are done.
+
+## Quick start
+
+Open an elevated PowerShell window in this directory:
+
+```powershell
+.\transit-mode.ps1 diagnose
+.\transit-mode.ps1 on
+```
+
+The first run verifies or installs the sensor dependencies and may ask for administrator approval. Keep the laptop ventilated, do not charge it inside a bag, and do not place it on soft material that blocks airflow.
+
+When you are back:
+
+```powershell
+.\transit-mode.ps1 off
+```
+
+That restores the original power plan and hibernation setting, stops the watchdog, and removes the temporary Transit Mode state.
+
+## Commands
+
+```text
+on        Enable Transit Mode
+off       Restore the previous configuration
+status    Show the current mode, watchdog, and temperature state
+diagnose  Check sensor access and hibernation readiness
+```
+
+If the watchdog has already hibernated the laptop, resume Windows and run `off` once the machine is safely out of the bag.
+
+## What it protects
+
+- Reduced CPU power and no boost, on AC and battery
+- Lid close set to “do nothing” while Transit Mode is active
+- CPU temperature sampled every five seconds
+- Automatic hibernation at 90 °C, or after 30 seconds in the 80 °C hot band
+- Automatic hibernation if temperature readings disappear for 30 seconds
+- Wake events suppressed while hibernating
+- Original settings restored by `off`
+
+Thermal history is retained in:
+
+```text
+C:\ProgramData\TransitMode\thermal-YYYY-MM-DD.csv
+```
+
+The sensor driver remains installed because it is a shared dependency. Transit Mode does not change Lenovo Vantage profiles, RyzenAdj firmware limits, or GPU and battery temperature controls.
+
+## Benchmark
+
+`codex-benchmark.sh` runs a repeatable approximation of a real frontend coding session in WSL. It starts a disposable dev server, edits and requests code, waits between tasks, runs ESLint, tests, and project checks, then records timings.
+
+```bash
+./codex-benchmark.sh normal
+./codex-benchmark.sh transit
+```
+
+The default run lasts 15 minutes. Pass a number for a shorter experiment, in minutes:
+
+```bash
+./codex-benchmark.sh normal 2
+```
+
+Results are written to `benchmark-results/`. The benchmark verifies the requested mode before starting and never modifies the live frontend checkout.
+
+## Requirements
+
+- Windows 11 with PowerShell
+- Administrator approval when requested
+- Enough free disk space for a full hibernation file
+- WSL, Node 24, pnpm, and the frontend checkout for the optional benchmark
+
+This is a practical convenience and safety tool, not a guarantee that every laptop or bag is thermally safe. Keep airflow sensible and use `status` when in doubt.
