@@ -158,7 +158,7 @@ Current Transit Mode:
 
 ```text
 PROCTHROTTLEMIN → 5%
-PROCTHROTTLEMAX → 50%
+PROCTHROTTLEMAX → 45%
 ```
 
 The 5% minimum is intentional: because Transit Mode clones an arbitrary active plan, this prevents an inherited high minimum (e.g. a High Performance-style configuration) from conflicting with the new maximum.

@@ -12,15 +12,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ---- Transit profile ---------------------------------------------------------
-
-$CpuMinPercent = 5
-$CpuMaxPercent = 50
-$CpuEppPercent = 100
-$CpuBoostMode  = 0     # 0 = disabled
-$LidAction     = 0     # 0 = do nothing
-$SleepTimeout  = 0     # seconds; 0 = never idle-sleep
-
 # ---- Storage -----------------------------------------------------------------
 
 $StateDir  = Join-Path $env:ProgramData "TransitMode"
@@ -33,7 +24,7 @@ $WatchdogStatusFile      = Join-Path $StateDir "watchdog-status.json"
 $WatchdogLogFile         = Join-Path $StateDir "watchdog.log"
 $ThermalLogPattern       = Join-Path $StateDir "thermal-YYYY-MM-DD.csv"
 $DiagnosticFile          = Join-Path $StateDir "diagnostic.txt"
-$WatchdogStartupTimeout  = 40
+$WatchdogInstalledConfig = Join-Path $StateDir "transit-watchdog.config.json"
 
 $SensorVersion     = "0.9.6"
 $SensorDir         = Join-Path $StateDir "lib\v$SensorVersion"
@@ -61,12 +52,13 @@ $SubProcessor = "54533251-82be-4824-96c1-47b60b740d00"
 $SubSleep     = "238c9fa8-0aad-41ed-83f4-97be242c8f20"
 $SubButtons   = "4f971e89-eebd-4455-a8de-9e59040e7347"
 
-$SettingCpuMin   = "893dee8e-2bef-41e0-89c6-b55d0929964c"
-$SettingCpuMax   = "bc5038f7-23e0-4960-96da-33abaf5935ec"
-$SettingCpuEpp   = "36687f9e-e3a5-4dbf-b1dc-15eb381c6863"
-$SettingCpuBoost = "be337238-0d82-4146-a960-4f3749d470c7"
-$SettingLid      = "5ca83367-6e45-459f-a27b-476b1d01c936"
-$SettingSleep    = "29f6c1db-86da-48c5-9fdb-f2b67b1f44da"
+$SettingCpuMin     = "893dee8e-2bef-41e0-89c6-b55d0929964c"
+$SettingCpuMax     = "bc5038f7-23e0-4960-96da-33abaf5935ec"
+$SettingCpuEpp     = "36687f9e-e3a5-4dbf-b1dc-15eb381c6863"
+$SettingCpuBoost   = "be337238-0d82-4146-a960-4f3749d470c7"
+$SettingLid        = "5ca83367-6e45-459f-a27b-476b1d01c936"
+$SettingSleep      = "29f6c1db-86da-48c5-9fdb-f2b67b1f44da"
+$SettingWakeTimers = "bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d"
 
 # ---- Helpers -----------------------------------------------------------------
 
@@ -538,6 +530,9 @@ function Start-Watchdog {
     Remove-WatchdogTask
     Remove-Item -LiteralPath $WatchdogInstalledScript -Force -ErrorAction SilentlyContinue
     Copy-Item -LiteralPath $WatchdogSourceScript -Destination $WatchdogInstalledScript -Force
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "transit-config.ps1") -Destination $StateDir -Force
+    # Serialize the validated in-memory settings, not a possibly edited source file.
+    $WatchdogConfig | ConvertTo-Json | Set-Content -LiteralPath $WatchdogInstalledConfig -Encoding UTF8
     Remove-Item -LiteralPath $WatchdogStatusFile -Force -ErrorAction SilentlyContinue
 
     $powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -634,7 +629,13 @@ function Get-WatchdogHealth {
     if (($null -ne $status) -and ($null -ne $status.PSObject.Properties["UpdatedAt"])) {
         $updatedAt = [DateTimeOffset]::MinValue
         if ([DateTimeOffset]::TryParse([string]$status.UpdatedAt, [ref]$updatedAt)) {
-            $isFresh = ([DateTimeOffset]::UtcNow - $updatedAt.ToUniversalTime()).TotalSeconds -le 15
+            # Older workers did not publish their polling interval (five seconds).
+            $freshnessSeconds = 15
+            $pollProperty = $status.PSObject.Properties["PollIntervalSeconds"]
+            if ($null -ne $pollProperty -and $pollProperty.Value -is [ValueType] -and $pollProperty.Value -gt 0) {
+                $freshnessSeconds = [double]$pollProperty.Value * 3
+            }
+            $isFresh = ([DateTimeOffset]::UtcNow - $updatedAt.ToUniversalTime()).TotalSeconds -le $freshnessSeconds
         }
     }
 
@@ -650,6 +651,23 @@ function Get-WatchdogHealth {
 }
 
 # ---- Actions -----------------------------------------------------------------
+
+# Recovery and status must work even when editable configuration is broken.
+if ($Action -in @("on", "diagnose")) {
+    . (Join-Path $PSScriptRoot "transit-config.ps1")
+    $ModeConfig = Read-TransitConfig -Path (Join-Path $PSScriptRoot "transit-mode.config.json") -Kind mode
+    $WatchdogConfig = Read-TransitConfig -Path (Join-Path $PSScriptRoot "transit-watchdog.config.json") -Kind watchdog
+    Assert-TransitStartupTiming -Mode $ModeConfig -Watchdog $WatchdogConfig
+
+    $CpuMinPercent = $ModeConfig.cpuMinPercent
+    $CpuMaxPercent = $ModeConfig.cpuMaxPercent
+    $CpuEppPercent = $ModeConfig.cpuEppPercent
+    $CpuBoostMode = $ModeConfig.cpuBoostMode
+    $LidAction = $ModeConfig.lidAction
+    $SleepTimeout = $ModeConfig.sleepTimeoutSeconds
+    $WakeTimers = $ModeConfig.wakeTimers
+    $WatchdogStartupTimeout = $ModeConfig.watchdogStartupTimeoutSeconds
+}
 
 switch ($Action) {
     "on" {
@@ -718,8 +736,9 @@ switch ($Action) {
             Set-PowerValue $transitScheme $SubProcessor $SettingCpuMax   $CpuMaxPercent
             Set-PowerValue $transitScheme $SubProcessor $SettingCpuEpp   $CpuEppPercent
             Set-PowerValue $transitScheme $SubProcessor $SettingCpuBoost $CpuBoostMode
-            Set-PowerValue $transitScheme $SubButtons   $SettingLid      $LidAction
-            Set-PowerValue $transitScheme $SubSleep     $SettingSleep    $SleepTimeout
+            Set-PowerValue $transitScheme $SubButtons   $SettingLid        $LidAction
+            Set-PowerValue $transitScheme $SubSleep     $SettingSleep      $SleepTimeout
+            Set-PowerValue $transitScheme $SubSleep     $SettingWakeTimers $WakeTimers
 
             Invoke-PowerCfg -PowerArgs @("/setactive", $transitScheme) | Out-Null
 
@@ -733,12 +752,13 @@ switch ($Action) {
             Write-Host "  CPU min state  -> $CpuMinPercent%"
             Write-Host "  CPU max state  -> $CpuMaxPercent%"
             Write-Host "  CPU EPP        -> $CpuEppPercent"
-            Write-Host "  CPU boost      -> disabled"
-            Write-Host "  Lid close      -> do nothing"
-            Write-Host "  Idle sleep     -> never"
+            Write-Host "  CPU boost mode -> $CpuBoostMode (0 = disabled)"
+            Write-Host "  Lid action     -> $LidAction (0 = do nothing)"
+            Write-Host "  Idle sleep     -> $SleepTimeout seconds (0 = never)"
+            Write-Host "  Wake timers    -> $WakeTimers (0 = disabled)"
             Write-Host "  Watchdog       -> $($watchdogStatus.CpuTemperatureC) C"
             Write-Host "  Sensor driver  -> PawnIO v$pawnIoInstalledVersion"
-            Write-Host "  Hibernates     -> 80 C sustained / 90 C immediately / sensor failure"
+            Write-Host "  Hibernates     -> $($watchdogStatus.SustainedLimitC) C hot band for $($watchdogStatus.SustainedSeconds) s / $($watchdogStatus.CriticalLimitC) C immediately / sensor missing $($watchdogStatus.SensorFailureGrace) s"
             Write-Host ""
             Write-Host "Original scheme preserved: $originalScheme"
         }

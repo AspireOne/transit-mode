@@ -60,13 +60,60 @@ diagnose  Check sensor access and hibernation readiness
 
 If the watchdog has already hibernated the laptop, resume Windows and run `off` once the machine is safely out of the bag.
 
-## What it protects
+## Configuration
+
+Edit the JSON files beside the scripts. Settings take effect on the next `on`;
+if Transit Mode is already active, run `off` and then `on` to apply changes.
+`diagnose` validates the files and probes sensors using the source watchdog config.
+
+- [transit-mode.config.json](transit-mode.config.json): CPU limits, power-plan behavior, and watchdog startup timeout.
+- [transit-watchdog.config.json](transit-watchdog.config.json): thermal thresholds, polling, grace periods, and log retention.
+
+All fields are required integers; unknown fields, invalid values, and malformed
+JSON cause an error before activation changes the system. JSON does not allow comments.
+
+| Main setting | Meaning / allowed values |
+| --- | --- |
+| `cpuMinPercent`, `cpuMaxPercent`, `cpuEppPercent` | 0–100; minimum must not exceed maximum. EPP 100 prefers efficiency. |
+| `cpuBoostMode` | Windows boost mode index 0–6; 0 disables boost. |
+| `lidAction` | 0 = do nothing, 1 = sleep, 2 = hibernate, 3 = shut down. |
+| `sleepTimeoutSeconds` | Seconds before idle sleep; 0 = never. |
+| `wakeTimers` | 0 = disabled, 1 = enabled, 2 = important timers only. |
+| `watchdogStartupTimeoutSeconds` | Positive; must exceed the watchdog's `startupGraceSeconds`. |
+
+Watchdog temperatures are integer degrees Celsius (1–200), with
+`temperatureResetC < sustainedTemperatureC < criticalTemperatureC`.
+Crossing the sustained threshold starts the timer; cooling to the reset threshold
+clears it. `sustainedTemperatureTimeSeconds` controls how long that timer may run.
+Timing fields are positive seconds. `pollIntervalSeconds` must not exceed
+`sustainedTemperatureTimeSeconds` or `missingSensorGraceSeconds`, and must be less
+than `resumeGapSeconds` (the scheduling gap that resets thermal timers).
+`startupGraceSeconds` is the time allowed to obtain the first sensor reading.
+`thermalLogRetentionDays` is a positive day count, capped at 36,500.
+Numeric validation checks consistency; it does not establish safe thermal limits
+for a particular laptop.
+
+Activation saves the validated watchdog settings to
+`C:\ProgramData\TransitMode\transit-watchdog.config.json`, alongside the installed
+worker and shared loader. Editing the source files cannot change that session,
+including when its task restarts. `off` and `status` work independently of the
+editable config files. `state.json` remains recovery data, not configuration.
+Keep both JSON files and `transit-config.ps1` with the source scripts when moving them.
+
+To run the configuration tests without activating Transit Mode, use Windows PowerShell:
+
+```powershell
+Invoke-Pester .\tests\configuration.Tests.ps1
+```
+
+## What it protects (with the supplied configuration)
 
 - Reduced CPU power and no boost, on AC and battery
 - Lid close set to “do nothing” while Transit Mode is active
+- Wake timers disabled on AC and battery
 - Watchdog samples CPU temperature every five seconds
-- Automatic hibernation at 90 °C, or after 30 seconds in the 80 °C hot band
-- Automatic hibernation if temperature readings disappear for 30 seconds
+- Automatic hibernation at 82 °C, or after 30 seconds in the 80 °C hot band
+- Automatic hibernation if temperature readings disappear for 22 seconds
 - Wake events suppressed while hibernating
 - Original settings restored by `off`
 

@@ -13,15 +13,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$PollIntervalSeconds       = 5
-$SustainedTemperatureC     = 80
-$SustainedTemperatureTime  = 30
-$TemperatureResetC         = 75
-$CriticalTemperatureC      = 90
-$MissingSensorGraceSeconds = 30
-$StartupGraceSeconds       = 30
-$ResumeGapSeconds          = 20
-$ThermalLogRetentionDays   = 30
+# These remain null if config loading fails, so emergency status can still be written.
+$PollIntervalSeconds = $null
+$SustainedTemperatureC = $null
+$SustainedTemperatureTime = $null
+$CriticalTemperatureC = $null
+$MissingSensorGraceSeconds = $null
 
 $StateDir          = Join-Path $env:ProgramData "TransitMode"
 $StateFile         = Join-Path $StateDir "state.json"
@@ -123,6 +120,7 @@ function Write-WatchdogStatus {
         SustainedSeconds   = $SustainedTemperatureTime
         CriticalLimitC     = $CriticalTemperatureC
         SensorFailureGrace = $MissingSensorGraceSeconds
+        PollIntervalSeconds = $PollIntervalSeconds
     }
 
     $tempFile = "$WatchdogStatusFile.$PID.tmp"
@@ -476,6 +474,20 @@ $computer = $null
 $monitoringEstablished = $false
 
 try {
+    # Load inside the fail-safe boundary: an invalid installed config during a
+    # task restart must still trigger recovery for an active Transit session.
+    . (Join-Path $PSScriptRoot "transit-config.ps1")
+    $config = Read-TransitConfig -Path (Join-Path $PSScriptRoot "transit-watchdog.config.json") -Kind watchdog
+    $PollIntervalSeconds = $config.pollIntervalSeconds
+    $SustainedTemperatureC = $config.sustainedTemperatureC
+    $SustainedTemperatureTime = $config.sustainedTemperatureTimeSeconds
+    $TemperatureResetC = $config.temperatureResetC
+    $CriticalTemperatureC = $config.criticalTemperatureC
+    $MissingSensorGraceSeconds = $config.missingSensorGraceSeconds
+    $StartupGraceSeconds = $config.startupGraceSeconds
+    $ResumeGapSeconds = $config.resumeGapSeconds
+    $ThermalLogRetentionDays = $config.thermalLogRetentionDays
+
     New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
     if ($Action -eq "run") {
         Remove-ExpiredThermalLogs

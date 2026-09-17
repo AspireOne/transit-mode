@@ -5,8 +5,8 @@
 - **Temporary cloned Windows power plan** — current foundation; highly reversible.
 - **CPU boost disable** — current; removes expensive turbo/boost behavior.
 - **EPP / efficiency preference** — current; biases CPPC strongly toward efficient operating points.
-- **CPU min/max performance state** — current; 5–50% initial envelope.
-- **Lid action + idle sleep** — current; keep the machine fully awake with lid closed.
+- **CPU min/max performance state** — current; 5–45% envelope.
+- **Lid action + idle sleep + wake timers** — current; keep the machine awake with lid closed without allowing timed wake-ups.
 - **Energy Saver** — optional; reduces broader Windows/app background power.
 - **Lenovo Fn+Q / Power Saving (Quiet)** — useful OEM-level platform/fan policy; not currently automated.
 - **Hard maximum CPU frequency** — optional stronger CPU ceiling.
@@ -33,13 +33,15 @@ off        → reactivate A → delete T
 
 This is the core reversibility mechanism.
 
+The plan disables wake timers (`0`) explicitly for both AC and battery. This prevents scheduled maintenance or application timers from waking the laptop while Transit Mode remains active.
+
 ### CPU minimum / maximum performance
 
 Current:
 
 ```text
 minimum → 5%
-maximum → 50%
+maximum → 45%
 ```
 
 Windows exposes processor min/max performance as percentages. The 5% minimum prevents an inherited High Performance-style minimum from defeating the Transit cap.
@@ -212,9 +214,9 @@ Reliability behavior:
 - `on` waits for a fresh, valid CPU temperature before it reports success. Failure rolls the power plan and hibernation setting back.
 - When hibernation is initially disabled, `on` checks that the system drive can hold Windows' full hibernation file before it persists recovery state or changes power configuration. Windows documents the full file's default size as 40% of physical memory.
 - The worker samples every five seconds, writes an atomic latest-value heartbeat, and appends every sample—including missing-sensor intervals—to daily `thermal-YYYY-MM-DD.csv` files under `C:\ProgramData\TransitMode`. Thermal history is retained for 30 days. The separate `watchdog.log` records startup, periodic summaries, and exceptional events.
-- 90 °C triggers immediate hibernation.
+- 82 °C triggers immediate hibernation.
 - Crossing 80 °C starts a 30-second hot timer. Cooling to 75 °C resets it; otherwise the system hibernates.
-- Thirty seconds without a plausible sensor value triggers hibernation after monitoring has become healthy.
+- Twenty-two seconds without a plausible sensor value triggers hibernation after monitoring has become healthy.
 - Unexpected power-plan replacement or a fatal watchdog error triggers hibernation.
 - `SetSuspendState(S4)` is primary and disables wake events so a timer cannot resume the laptop while it remains packed away. `shutdown.exe /h` is the state-preserving fallback. If both fail during an emergency, the worker uses an immediate forced shutdown rather than leave a hot, unmonitored machine running; that last resort can lose unsaved work.
 

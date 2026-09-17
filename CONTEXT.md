@@ -55,11 +55,12 @@ This keeps Codex alive, but leaves the laptop free to consume its normal peak po
 `transit-mode.ps1` creates a **temporary clone of the currently active Windows power plan** and modifies only that clone:
 
 - CPU minimum state → 5%
-- CPU maximum state → 50%
+- CPU maximum state → 45%
 - CPU EPP → 100 / maximum efficiency preference
 - CPU boost → disabled
 - Lid close → do nothing
 - Idle sleep → never
+- Wake timers → disabled
 - Same policy on AC and battery
 
 The original power plan is never modified.
@@ -72,8 +73,8 @@ The original power plan is never modified.
 - A hidden SYSTEM scheduled task supervises the worker, restarts it after failure, and starts it after an unexpected reboot.
 - `on` does not report success until the worker has produced a valid temperature.
 - Every five-second sample is appended to a daily `C:\ProgramData\TransitMode\thermal-YYYY-MM-DD.csv` file. History survives `off`; files older than 30 days are removed when the watchdog starts.
-- The machine hibernates immediately at 90 °C, or after entering the 80 °C hot band and failing to cool to 75 °C within 30 seconds.
-- Loss of valid sensor readings for 30 seconds, watchdog failure, or unexpected deactivation of the Transit power plan also triggers hibernation.
+- The machine hibernates immediately at 82 °C, or after entering the 80 °C hot band and failing to cool to 75 °C within 30 seconds.
+- Loss of valid sensor readings for 22 seconds, watchdog failure, or unexpected deactivation of the Transit power plan also triggers hibernation.
 - If both Windows hibernation mechanisms fail during an emergency, an immediate forced shutdown is the final safety fallback and can lose unsaved work.
 
 If hibernation was disabled before `on`, Transit Mode enables it temporarily and `off` disables it again. A full hibernation file needs roughly 40% of installed RAM on the system drive; `on` checks that space before changing anything. Emergency hibernation deliberately leaves the low-power plan and recovery state active. After resuming, the user runs `off` somewhere safe.
@@ -91,6 +92,6 @@ This gives stronger reversibility than editing the active plan and trying to rec
 1. Free enough system-drive space for the full hibernation file, then complete the real `on` → `status` → `off` lifecycle test. With 32 GiB installed RAM, allow at least about 12.8 GiB free; more headroom is prudent.
 2. Run controlled tests: desk open → desk closed → bag open → bag closed.
 3. Test both normal Codex activity and deliberately heavy builds/tests.
-4. Calibrate the conservative 80/90 °C thresholds downward if chassis or bag temperatures become uncomfortable first.
+4. Calibrate the conservative 80/82 °C thresholds downward if chassis or bag temperatures become uncomfortable first.
 5. Do not charge inside the bag; the watchdog currently observes CPU temperature, not battery or chassis temperature.
 6. Only if Windows-level limits are insufficient, evaluate stronger controls such as Lenovo Power Saving mode or RyzenAdj power limits.

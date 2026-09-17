@@ -1,0 +1,10 @@
+{
+  "cpuMinPercent": 5,
+  "cpuMaxPercent": 45,
+  "cpuEppPercent": 100,
+  "cpuBoostMode": 0,
+  "lidAction": 0,
+  "sleepTimeoutSeconds": 0,
+  "wakeTimers": 0,
+  "watchdogStartupTimeoutSeconds": 40
+}
