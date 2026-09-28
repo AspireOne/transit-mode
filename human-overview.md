@@ -13,14 +13,16 @@ History → every reading in C:\ProgramData\TransitMode\thermal-YYYY-MM-DD.csv (
 Sensor access → verified LibreHardwareMonitor 0.9.6 + signed PawnIO 2.2.0 driver
 Hibernate → 82 °C immediately, 80 °C hot band for 30 seconds, or 22 seconds without a sensor
 
-on  → verify dependencies/storage → enable hibernation if needed → activate cloned plan → require healthy watchdog
-off → stop watchdog → restore untouched plan → restore hibernation setting → clean up
+on  → require full hibernation → verify dependencies → arm watchdog → activate clone → require healthy heartbeat
+off → restore and verify original plan → stop watchdog → clean up; failed restoration keeps monitoring
 
-Emergency → hibernate first → leave Transit plan/recovery state intact → run off after resuming
-Emergency wake behavior → suppress wake events/timers while entering hibernation
+Emergency → restore original plan → hibernate → run off after resuming to finish cleanup
+Failed emergency restoration → retry restoration and hibernation after resume
+Monitoring gap → more than 20 seconds triggers emergency recovery; timers use monotonic time
+Emergency wake behavior → native path requests wake suppression; shutdown.exe fallback cannot
 Last resort → force shutdown only if both hibernation methods fail; unsaved work can be lost
 
-Does not touch → Lenovo Fn+Q/Vantage, Energy Saver, RyzenAdj/firmware limits
+Does not touch → hibernation configuration, Lenovo Fn+Q/Vantage, Energy Saver, RyzenAdj/firmware limits
+Concurrent commands → rejected by an exclusive controller lock
 Does not monitor → battery or chassis temperature; do not charge inside a bag
 Leaves installed → PawnIO driver (shared sensor dependency)
-

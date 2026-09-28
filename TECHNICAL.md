@@ -211,18 +211,23 @@ Reliability behavior:
 - LibreHardwareMonitor 0.9.6 and its required DLLs are downloaded from the official GitHub release, pinned by version, and SHA-256 verified before loading.
 - LibreHardwareMonitor's AMD path uses PawnIO to read SMN registers. The controller installs the official signed PawnIO 2.2.0 driver when missing, after verifying both its pinned SHA-256 and Authenticode signature. PawnIO is a shared system dependency and is intentionally not uninstalled by `off`.
 - A hidden SYSTEM scheduled task starts the worker, restarts it after an unexpected failure, and has an at-startup trigger for recovery after a reboot.
-- `on` waits for a fresh, valid CPU temperature before it reports success. Failure rolls the power plan and hibernation setting back.
-- When hibernation is initially disabled, `on` checks that the system drive can hold Windows' full hibernation file before it persists recovery state or changes power configuration. Windows documents the full file's default size as 40% of physical memory.
+- `on` requires an armed watchdog before activating Transit, then waits for a fresh healthy heartbeat belonging to that session. Failed activation uses the same ordered restoration routine as `off`: restore and verify the original plan before removing monitoring.
+- Full hibernation is a prerequisite. New sessions never alter its configuration, avoiding ambiguity between disabled and reduced hibernation files. Version 1/2 recovery states remain supported.
 - The worker samples every five seconds, writes an atomic latest-value heartbeat, and appends every sample—including missing-sensor intervals—to daily `thermal-YYYY-MM-DD.csv` files under `C:\ProgramData\TransitMode`. Thermal history is retained for 30 days. The separate `watchdog.log` records startup, periodic summaries, and exceptional events.
 - 82 °C triggers immediate hibernation.
 - Crossing 80 °C starts a 30-second hot timer. Cooling to 75 °C resets it; otherwise the system hibernates.
 - Twenty-two seconds without a plausible sensor value triggers hibernation after monitoring has become healthy.
-- Unexpected power-plan replacement or a fatal watchdog error triggers hibernation.
-- `SetSuspendState(S4)` is primary and disables wake events so a timer cannot resume the laptop while it remains packed away. `shutdown.exe /h` is the state-preserving fallback. If both fail during an emergency, the worker uses an immediate forced shutdown rather than leave a hot, unmonitored machine running; that last resort can lose unsaved work.
+- A plan other than Transit or the saved original, a fatal watchdog error, or a monitoring gap over 20 seconds triggers emergency recovery. Timing uses a monotonic clock; unexplained gaps do not clear danger timers.
+- The native path explicitly enables `SeShutdownPrivilege`, then calls `SetSuspendState(S4)` with wake events disabled. `shutdown.exe /h` is the fallback and has no equivalent wake-suppression option. If both fail, the worker requests immediate forced shutdown; that last resort can lose unsaved work. Native declarations compile, but physical emergency/resume behavior and runtime privilege enabling remain unverified.
 
 These are conservative project thresholds, not manufacturer limits. AMD specifies 95 °C Tjmax for the Ryzen 7 7735HS.
 
-The emergency path does not reactivate the normal plan first because that could re-enable boost while the laptop is already hot. Transit state remains in place after resume until `off` is run.
+Emergency recovery restores the original plan before attempting hibernation, so resume does not leave the Transit plan without monitoring. This briefly restores normal CPU settings before hibernation. If plan restoration fails, the worker keeps retrying restoration and hibernation after resume. Recovery files and the task remain for `off` to clean up.
+
+Controller mutations hold an exclusive file lock in the protected state directory.
+Recovery state and heartbeat updates replace existing files atomically. Health
+requires a running task, matching session, plausible temperature, and a heartbeat
+whose age is nonnegative and no more than three polling intervals.
 
 Current scope is intentionally CPU-only. It does not prove safe battery, SSD, skin, or bag temperature, so initial bag tests remain battery-only and progressive. Do not charge the laptop inside the bag.
 

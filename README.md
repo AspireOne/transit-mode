@@ -6,15 +6,14 @@ It's especially useful for background work - a coding agent, build, test suite, 
 
 Transit Mode lowers CPU power demand, disables CPU boost, keeps the machine awake with the lid closed, and crucially, watches the CPU temperature using an independent watchdog. If the temperature stays too high, the watchdog hibernates the laptop automatically.
 
-It is deliberately boring. It changes a temporary Windows power plan, watches the machine, and 100% restores what it found when you are done.
+It changes a temporary Windows power plan, watches CPU temperature, and restores the saved original plan when you are done. Incomplete recovery is reported and its state is retained for another `off` attempt.
 
 ## Compatibility and requirements
 
 Transit Mode runs on **64-bit Windows 10 or 11** with the built-in Windows PowerShell 5.1 (the script re-launches itself if started from PowerShell 7). It is tested on one machine: Lenovo IdeaPad Slim 5 15ARP10 (Ryzen 7 7735HS), Windows 11.
 
-- **Administrator approval** is required once per `on`/`off` for power-plan changes, hibernation, the scheduled watchdog task, and the sensor driver.
-- **Hibernation must be supported by the firmware.** `on` enables it when disabled and verifies it afterwards; on machines without S4 it fails with a clear error before changing anything.
-- **Enough free space on the system drive for a full hibernation file** — about 40% of installed RAM. `on` checks this up front.
+- **Administrator approval** is required once per `on`/`off` for power-plan changes, the scheduled watchdog task, and the sensor driver. Results and errors appear in the calling terminal.
+- **Full hibernation must already be available.** If needed, run `powercfg /hibernate /type full` once in an administrator terminal. `on` checks availability before changing power settings. Transit Mode leaves the hibernation configuration unchanged.
 - **The watchdog needs the signed PawnIO kernel driver.** LibreHardwareMonitor reads CPU temperatures through it on both AMD and Intel CPUs; Memory Integrity (HVCI) does not block it. `on` installs it only after verifying its SHA-256 and Authenticode signature, and `diagnose` confirms a live temperature reading before use.
 - **On Modern Standby (S0) laptops**, "lid close → do nothing" is honored, but the system can still drop into S0 low-power idle when the workload goes quiet, which throttles background work. Transit Mode does not hold a Windows execution request; it relies on the running work itself keeping the machine busy. This holds on the tested machine; on other S0 laptops, verify with `status` and a short test run first.
 - **OEM power managers** (Lenovo Vantage Fn+Q, MyASUS, manufacturer utilities) may override the temporary plan's settings. Transit Mode does not change them.
@@ -45,7 +44,7 @@ When you are back:
 .\transit-mode.ps1 off
 ```
 
-That restores the original power plan and hibernation setting, stops the watchdog, and removes the temporary Transit Mode state.
+That restores and verifies the original power plan before stopping the watchdog, then removes the temporary plan and recovery state. If restoration fails, the watchdog and recovery state remain. Overlapping mutating commands are rejected.
 
 I also recommend creating an alias/function in your powershell profile (e.g. `transit-mode on|off|status|diagnose`), in order to be able to switch easily, and also create a function that will print an informational `Transit Mode is ON` when your terminal opens, so you do not forget about it.
 
@@ -58,7 +57,7 @@ status    Show the current mode, watchdog, and temperature state
 diagnose  Check sensor access and hibernation readiness
 ```
 
-If the watchdog has already hibernated the laptop, resume Windows and run `off` once the machine is safely out of the bag.
+An emergency first attempts to restore the original power plan, then hibernates. If restoration failed, the worker retries restoration and hibernation after resume instead of exiting unprotected. Run `off` after resuming to remove the temporary plan, task, and recovery files.
 
 ## Configuration
 
@@ -87,7 +86,9 @@ Crossing the sustained threshold starts the timer; cooling to the reset threshol
 clears it. `sustainedTemperatureTimeSeconds` controls how long that timer may run.
 Timing fields are positive seconds. `pollIntervalSeconds` must not exceed
 `sustainedTemperatureTimeSeconds` or `missingSensorGraceSeconds`, and must be less
-than `resumeGapSeconds` (the scheduling gap that resets thermal timers).
+than `resumeGapSeconds` (the maximum permitted monitoring gap). Exceeding that
+gap triggers emergency recovery; it never resets accumulated hot or missing-sensor
+time. Intervals use a monotonic clock, so wall-clock changes cannot extend them.
 `startupGraceSeconds` is the time allowed to obtain the first sensor reading.
 `thermalLogRetentionDays` is a positive day count, capped at 36,500.
 Numeric validation checks consistency; it does not establish safe thermal limits
@@ -103,7 +104,7 @@ Keep both JSON files and `transit-config.ps1` with the source scripts when movin
 To run the configuration tests without activating Transit Mode, use Windows PowerShell:
 
 ```powershell
-Invoke-Pester .\tests\configuration.Tests.ps1
+Invoke-Pester .\tests -EnableExit
 ```
 
 ## What it protects (with the supplied configuration)
@@ -114,7 +115,9 @@ Invoke-Pester .\tests\configuration.Tests.ps1
 - Watchdog samples CPU temperature every five seconds
 - Automatic hibernation at 82 °C, or after 30 seconds in the 80 °C hot band
 - Automatic hibernation if temperature readings disappear for 22 seconds
-- Wake events suppressed while hibernating
+- Emergency recovery after a monitoring gap longer than 20 seconds
+- Watchdog armed before the temporary plan is activated
+- Native hibernation requests wake-event suppression; the shutdown.exe fallback does not provide that option
 - Original settings restored by `off`
 
 Thermal history is retained in:
@@ -137,7 +140,7 @@ A: There's no model-specific API to read the current operation mode and restore 
 
 **Q: Can I keep my laptop closed in my enclosed bag?**
 
-A: That's what was the aim of this. Do not prefer it, but do try it. After a trial run, inspect the log file with temps - if they look okay, then you're good. Note: Nothing bad should happen - there is our watchdog, which hibernates the PC if temperatures rise above appropriate, and there's also firmware-level throttling and shutdown controls. The only negative effects would be on battery, but trying it once or a few times should be okay. Don't hold me liable for your battery though :D
+A: The script reduces CPU load and reacts to CPU temperature, but that does not establish that an enclosed bag is safe. It does not measure battery, chassis, or bag temperature. Keep ventilation available; CPU logs alone cannot validate those conditions.
 
 **Q: Why monitor only CPU temp, but not GPU, SSD, or Battery?**
 

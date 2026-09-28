@@ -238,7 +238,7 @@ function Assert-RecoveryState {
         throw "Recovery state identifies the same scheme as original and temporary: $StateFile"
     }
 
-    if ([int]$State.Version -ge 2) {
+    if ([int]$State.Version -eq 2) {
         $hibernateProperty = $State.PSObject.Properties["HibernateWasEnabled"]
         if (($null -eq $hibernateProperty) -or ($hibernateProperty.Value -isnot [bool])) {
             throw "Recovery state has an invalid HibernateWasEnabled value: $StateFile"
@@ -751,9 +751,6 @@ switch ($Action) {
             StartedAt           = (Get-Date).ToString("o")
             OriginalScheme      = $originalScheme
             TransitScheme       = $transitScheme
-            HibernateWasEnabled = $true
-            WatchdogTask        = $WatchdogTaskName
-            ControllerProcessId = $PID
         }
         Save-State $state
 

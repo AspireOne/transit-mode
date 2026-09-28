@@ -71,25 +71,28 @@ The original power plan is never modified.
 - The release and extracted DLLs are pinned and SHA-256 verified.
 - The signed PawnIO 2.2.0 kernel driver supplies the privileged AMD register access LibreHardwareMonitor requires. Its official installer is pinned by SHA-256 and Authenticode-verified; the shared driver remains installed after `off`.
 - A hidden SYSTEM scheduled task supervises the worker, restarts it after failure, and starts it after an unexpected reboot.
-- `on` does not report success until the worker has produced a valid temperature.
+- `on` arms the worker before activating the cloned plan, then requires a fresh healthy heartbeat belonging to that session. Mutating commands hold an exclusive controller lock.
 - Every five-second sample is appended to a daily `C:\ProgramData\TransitMode\thermal-YYYY-MM-DD.csv` file. History survives `off`; files older than 30 days are removed when the watchdog starts.
 - The machine hibernates immediately at 82 °C, or after entering the 80 °C hot band and failing to cool to 75 °C within 30 seconds.
-- Loss of valid sensor readings for 22 seconds, watchdog failure, or unexpected deactivation of the Transit power plan also triggers hibernation.
+- Loss of valid sensor readings for 22 seconds, a monitoring gap over 20 seconds, watchdog failure, or activation of a plan other than Transit or the saved original also triggers emergency recovery.
 - If both Windows hibernation mechanisms fail during an emergency, an immediate forced shutdown is the final safety fallback and can lose unsaved work.
 
-If hibernation was disabled before `on`, Transit Mode enables it temporarily and `off` disables it again. A full hibernation file needs roughly 40% of installed RAM on the system drive; `on` checks that space before changing anything. Emergency hibernation deliberately leaves the low-power plan and recovery state active. After resuming, the user runs `off` somewhere safe.
+Full hibernation must be configured before `on`; new sessions never change that setting. Emergency recovery attempts to restore the original power plan before hibernating. If restoration fails, the worker retries after resume rather than exiting with Transit still active. Recovery state remains for `off` to finish cleanup.
 
 On `transit-mode off`, the script:
 
-1. reactivates the untouched original plan,
-2. deletes the temporary Transit plan,
-3. deletes recovery state only after successful restoration.
+1. saves the stopping state and restores/verifies the untouched original plan,
+2. stops/removes the watchdog and deletes the temporary Transit plan,
+3. deletes recovery state only after successful cleanup.
+
+A failed plan restoration leaves monitoring and recovery state intact. Recovery
+of legacy sessions still restores their saved hibernation setting.
 
 This gives stronger reversibility than editing the active plan and trying to reconstruct old values later.
 
 ## Remaining validation
 
-1. Free enough system-drive space for the full hibernation file, then complete the real `on` → `status` → `off` lifecycle test. With 32 GiB installed RAM, allow at least about 12.8 GiB free; more headroom is prudent.
+1. Physical emergency hibernation/resume remains unverified. The real `on` → `status` → `off` lifecycle passed on 2026-09-28; automated tests cover simulated emergency and failed recovery paths. See `docs/features/reliability-audit/RESOLUTION.md`.
 2. Run controlled tests: desk open → desk closed → bag open → bag closed.
 3. Test both normal Codex activity and deliberately heavy builds/tests.
 4. Calibrate the conservative 80/82 °C thresholds downward if chassis or bag temperatures become uncomfortable first.
