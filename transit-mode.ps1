@@ -105,25 +105,48 @@ function Restart-InWindowsPowerShell {
         throw "Cannot restart because the script path is unavailable."
     }
 
-    $quotedScript = '"' + $PSCommandPath.Replace('"', '\"') + '"'
-    $argumentLine = "-NoProfile -ExecutionPolicy Bypass -File $quotedScript $Action"
-
     if (-not $Elevate) {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath $Action
         exit $LASTEXITCODE
     }
 
-    $launchedAt = [DateTime]::UtcNow
-    $process = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argumentLine -Wait -PassThru
-
-    if (($Action -eq "diagnose") -and (Test-Path -LiteralPath $DiagnosticFile)) {
-        $diagnostic = Get-Item -LiteralPath $DiagnosticFile
-        if ($diagnostic.LastWriteTimeUtc -ge $launchedAt.AddSeconds(-1)) {
-            Get-Content -LiteralPath $DiagnosticFile
+    $resultFile = [IO.Path]::GetTempFileName()
+    try {
+        $scriptLiteral = "'" + $PSCommandPath.Replace("'", "''") + "'"
+        $resultLiteral = "'" + $resultFile.Replace("'", "''") + "'"
+        $command = @"
+try {
+    & $scriptLiteral $Action *> $resultLiteral
+    exit 0
+} catch {
+    (`$_ | Out-String) + `$_.ScriptStackTrace | Add-Content -LiteralPath $resultLiteral
+    exit 1
+}
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+        $exe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $process = Start-Process -FilePath $exe -Verb RunAs -WindowStyle Hidden `
+            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded" -Wait -PassThru
+        $output = Get-Content -LiteralPath $resultFile -Raw
+        if ($output) { Write-Host $output.TrimEnd() }
+        if ($process.ExitCode -ne 0) {
+            throw "Transit Mode '$Action' failed (exit $($process.ExitCode)). See the error above."
         }
     }
+    finally {
+        Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
+    }
+    exit 0
+}
 
-    exit $process.ExitCode
+function Enter-ControllerLock {
+    try {
+        return [IO.File]::Open((Join-Path $StateDir "controller.lock"),
+            [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    }
+    catch [IO.IOException] {
+        throw "Another Transit Mode operation is running, or its lock is unavailable: $($_.Exception.Message)"
+    }
 }
 
 function Invoke-PowerCfg {
@@ -168,7 +191,12 @@ function Save-State {
         ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath $tempFile -Encoding UTF8
 
-    Move-Item -LiteralPath $tempFile -Destination $StateFile -Force
+    if (Test-Path -LiteralPath $StateFile) {
+        [IO.File]::Replace($tempFile, $StateFile, [NullString]::Value)
+    }
+    else {
+        [IO.File]::Move($tempFile, $StateFile)
+    }
 }
 
 function Load-State {
@@ -190,11 +218,11 @@ function Assert-RecoveryState {
         }
     }
 
-    if ([int]$State.Version -notin @(1, 2)) {
+    if ([int]$State.Version -notin @(1, 2, 3)) {
         throw "Unsupported recovery-state version '$($State.Version)': $StateFile"
     }
 
-    if ([string]$State.Status -notin @("activating", "active")) {
+    if ([string]$State.Status -notin @("activating", "active", "stopping")) {
         throw "Invalid recovery-state status '$($State.Status)': $StateFile"
     }
 
@@ -447,26 +475,6 @@ function Enable-Hibernation {
     }
 }
 
-function Assert-HibernationStorageAvailable {
-    $physicalMemory = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction Stop |
-        ForEach-Object { [uint64]$_.Capacity } |
-        Measure-Object -Sum).Sum
-
-    if ($physicalMemory -le 0) {
-        throw "Could not determine installed physical memory before enabling hibernation."
-    }
-
-    $systemRoot = [IO.Path]::GetPathRoot([Environment]::SystemDirectory)
-    $drive = [IO.DriveInfo]::new($systemRoot)
-    $minimumBytes = [uint64][math]::Ceiling($physicalMemory * 0.40)
-
-    if ([uint64]$drive.AvailableFreeSpace -lt $minimumBytes) {
-        $freeGiB = $drive.AvailableFreeSpace / 1GB
-        $minimumGiB = $minimumBytes / 1GB
-        throw ("Hibernation needs a full hibernation file, but {0} has only {1:N1} GiB free; Windows needs at least about {2:N1} GiB for 40% of installed RAM. Free disk space, then run 'transit-mode on' again." -f $systemRoot, $freeGiB, $minimumGiB)
-    }
-}
-
 function Restore-HibernationState {
     param([Parameter(Mandatory)][bool]$WasEnabled)
 
@@ -495,6 +503,25 @@ function Get-StateHibernateWasEnabled {
 
 function Get-WatchdogTask {
     return Get-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
+}
+
+function Grant-WatchdogTaskReadAccess {
+    $scheduler = New-Object -ComObject Schedule.Service
+    $scheduler.Connect()
+    $task = $scheduler.GetFolder("\").GetTask($WatchdogTaskName)
+    # Task Scheduler can return a noncanonical DACL. Preserve its entries and
+    # ordering: CommonSecurityDescriptor.AddAccess refuses to edit such ACLs.
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new(
+        $task.GetSecurityDescriptor(4))
+    $readAccess = [Security.AccessControl.CommonAce]::new(
+        [Security.AccessControl.AceFlags]::None,
+        [Security.AccessControl.AceQualifier]::AccessAllowed,
+        [int]::MinValue,
+        [Security.Principal.WindowsIdentity]::GetCurrent().User,
+        $false, $null)
+    $descriptor.DiscretionaryAcl.InsertAce($descriptor.DiscretionaryAcl.Count, $readAccess)
+    $task.SetSecurityDescriptor(
+        $descriptor.GetSddlForm([Security.AccessControl.AccessControlSections]::Access), 0)
 }
 
 function Remove-WatchdogTask {
@@ -567,86 +594,105 @@ function Start-Watchdog {
         -Description "Failsafe CPU-temperature watchdog for Transit Mode." `
         -Force | Out-Null
 
+    Grant-WatchdogTaskReadAccess
     Start-ScheduledTask -TaskName $WatchdogTaskName
 
-    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($WatchdogStartupTimeout)
+    return Wait-Watchdog -TransitScheme $TransitScheme -States @("armed")
+}
+
+function Wait-Watchdog {
+    param([string]$TransitScheme, [string[]]$States)
+
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
-        if (Test-Path -LiteralPath $WatchdogStatusFile) {
-            try {
-                $status = Get-Content -LiteralPath $WatchdogStatusFile -Raw | ConvertFrom-Json
-                if (([string]$status.ExpectedScheme).ToLowerInvariant() -eq $TransitScheme.ToLowerInvariant()) {
-                    if ([string]$status.State -in @("healthy", "hot")) {
-                        return $status
-                    }
-
-                    if ([string]$status.State -eq "failed") {
-                        throw "Watchdog startup failed: $($status.Reason)"
-                    }
-                }
-            }
-            catch [System.ArgumentException] {
-                # The atomic status replacement may briefly race with antivirus/file indexing.
-            }
+        $health = Get-WatchdogHealth -ExpectedScheme $TransitScheme
+        if ($health.IsFresh -and $null -ne $health.Task -and
+            $health.Task.State -eq "Running" -and $health.Status.State -in $States) {
+            return $health.Status
         }
-
-        $task = Get-WatchdogTask
-        if (($null -eq $task) -or ($task.State -notin @("Running", "Queued"))) {
-            $taskInfo = Get-ScheduledTaskInfo -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
-            $taskResult = "unknown"
-            if ($null -ne $taskInfo) {
-                $taskResult = [string]$taskInfo.LastTaskResult
-            }
-            throw "Watchdog exited before becoming healthy. Task result: $taskResult."
+        if ($null -ne $health.Status -and $health.Status.State -in @("failed", "hibernating", "resumed-after-emergency")) {
+            throw "Watchdog startup failed: $($health.Status.Reason)"
         }
+        Start-Sleep -Milliseconds 250
+    } while ($timer.Elapsed.TotalSeconds -lt $WatchdogStartupTimeout)
 
-        Start-Sleep -Milliseconds 500
-    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+    throw "Watchdog did not reach '$($States -join ', ')' within $WatchdogStartupTimeout seconds. $($health.Reason)"
+}
 
-    throw "Watchdog did not report a valid CPU temperature within $WatchdogStartupTimeout seconds."
+function Restore-TransitSession {
+    param([Parameter(Mandatory)]$State)
+
+    if (-not (Test-SchemeExists $State.OriginalScheme)) {
+        throw "Original power scheme '$($State.OriginalScheme)' no longer exists. Recovery state retained at: $StateFile"
+    }
+    $State.Status = "stopping"
+    Save-State $State
+    # The worker keeps monitoring while Transit is active, and exits when the
+    # saved original plan is restored. Never stop it before restoring that plan.
+    Invoke-PowerCfg -PowerArgs @("/setactive", $State.OriginalScheme) | Out-Null
+    if ((Get-ActiveSchemeGuid) -ne $State.OriginalScheme) {
+        throw "Original power scheme was not restored. Watchdog and recovery state retained."
+    }
+    Remove-WatchdogTask
+    if (Test-SchemeExists $State.TransitScheme) {
+        Invoke-PowerCfg -PowerArgs @("/delete", $State.TransitScheme) | Out-Null
+    }
+    # New sessions never change hibernation. Preserve recovery for older sessions.
+    if ([int]$State.Version -lt 3) {
+        Restore-HibernationState -WasEnabled (Get-StateHibernateWasEnabled $State)
+    }
+    Remove-StateArtifacts
 }
 
 function Get-WatchdogHealth {
+    param([string]$ExpectedScheme)
+
     $task = $null
     $status = $null
-
-    try {
-        $task = Get-WatchdogTask
-    }
-    catch {
-        # Status remains useful when Task Scheduler details are not readable unelevated.
-    }
-
+    $isFresh = $false
+    $reason = "Watchdog status is missing."
+    try { $task = Get-WatchdogTask } catch { }
     if (Test-Path -LiteralPath $WatchdogStatusFile) {
         try {
             $status = Get-Content -LiteralPath $WatchdogStatusFile -Raw | ConvertFrom-Json
+            foreach ($name in @("UpdatedAt", "State", "ExpectedScheme", "PollIntervalSeconds", "CpuTemperatureC", "Reason")) {
+                if ($null -eq $status.PSObject.Properties[$name]) { throw "Status is missing '$name'." }
+            }
+            $interval = $status.PollIntervalSeconds
+            if (($interval -isnot [int] -and $interval -isnot [long]) -or $interval -le 0) {
+                throw "Status has an invalid polling interval."
+            }
+            if ($status.State -notin @("starting", "armed", "healthy", "hot", "sensor-missing", "hibernating", "resumed-after-emergency", "failed")) {
+                throw "Status has an invalid watchdog state."
+            }
+            if ($status.State -in @("armed", "healthy", "hot")) {
+                $temperature = $status.CpuTemperatureC
+                if (($temperature -isnot [int] -and $temperature -isnot [long] -and $temperature -isnot [double]) -or
+                    [double]::IsNaN($temperature) -or $temperature -le 0 -or $temperature -gt 200) {
+                    throw "Status has no valid CPU temperature."
+                }
+            }
+            $updatedAt = [DateTimeOffset]::MinValue
+            if (-not [DateTimeOffset]::TryParse([string]$status.UpdatedAt, [ref]$updatedAt)) {
+                throw "Status has an invalid timestamp."
+            }
+            if (-not $ExpectedScheme -or $status.ExpectedScheme -ne $ExpectedScheme) {
+                throw "Status does not belong to the current Transit session."
+            }
+            $age = ([DateTimeOffset]::UtcNow - $updatedAt).TotalSeconds
+            $isFresh = $age -ge 0 -and $age -le ([double]$interval * 3)
+            $reason = if ($isFresh) { "Watchdog is not reporting healthy monitoring." } else { "Watchdog heartbeat is stale or future-dated." }
         }
         catch {
-            # A corrupt or partially unavailable file is reported as unhealthy below.
+            $status = $null
+            $reason = "Invalid watchdog status: $($_.Exception.Message)"
         }
     }
-
-    $isFresh = $false
-    if (($null -ne $status) -and ($null -ne $status.PSObject.Properties["UpdatedAt"])) {
-        $updatedAt = [DateTimeOffset]::MinValue
-        if ([DateTimeOffset]::TryParse([string]$status.UpdatedAt, [ref]$updatedAt)) {
-            # Older workers did not publish their polling interval (five seconds).
-            $freshnessSeconds = 15
-            $pollProperty = $status.PSObject.Properties["PollIntervalSeconds"]
-            if ($null -ne $pollProperty -and $pollProperty.Value -is [ValueType] -and $pollProperty.Value -gt 0) {
-                $freshnessSeconds = [double]$pollProperty.Value * 3
-            }
-            $isFresh = ([DateTimeOffset]::UtcNow - $updatedAt.ToUniversalTime()).TotalSeconds -le $freshnessSeconds
-        }
-    }
-
+    $isReady = $null -ne $task -and $task.State -eq "Running" -and
+        $isFresh -and $null -ne $status -and $status.State -in @("healthy", "hot")
+    if ($isReady) { $reason = $null }
     return [pscustomobject]@{
-        Task    = $task
-        Status  = $status
-        IsFresh = $isFresh
-        IsReady = ($null -ne $task) -and
-            ($task.State -eq "Running") -and
-            $isFresh -and
-            ([string]$status.State -in @("healthy", "hot"))
+        Task = $task; Status = $status; IsFresh = $isFresh; IsReady = $isReady; Reason = $reason
     }
 }
 
@@ -669,60 +715,49 @@ if ($Action -in @("on", "diagnose")) {
     $WatchdogStartupTimeout = $ModeConfig.watchdogStartupTimeoutSeconds
 }
 
+if ($PSVersionTable.PSEdition -ne "Desktop") {
+    Restart-InWindowsPowerShell -Elevate:($Action -ne "status" -and -not (Test-IsAdministrator))
+}
+if ($Action -ne "status" -and -not (Test-IsAdministrator)) {
+    Restart-InWindowsPowerShell -Elevate
+}
+
+$controllerLock = $null
+try {
+    if ($Action -ne "status") {
+        Initialize-StateDirectory
+        $controllerLock = Enter-ControllerLock
+    }
 switch ($Action) {
     "on" {
-        # This read-only check gives a useful error in the caller's terminal and
-        # avoids a pointless UAC prompt when hibernation cannot fit on disk.
-        if ((-not (Test-IsAdministrator)) -and
-            (-not (Test-Path -LiteralPath $StateFile)) -and
-            (-not (Test-HibernationAvailable))) {
-            Assert-HibernationStorageAvailable
-        }
-
-        if ($PSVersionTable.PSEdition -ne "Desktop") {
-            Restart-InWindowsPowerShell -Elevate:(-not (Test-IsAdministrator))
-        }
-
-        if (-not (Test-IsAdministrator)) {
-            Restart-InWindowsPowerShell -Elevate
-        }
-
-        Initialize-StateDirectory
-
         if (Test-Path -LiteralPath $StateFile) {
             throw "Transit Mode already has recovery state. Run 'transit-mode off' first."
         }
 
+        if (-not (Test-HibernationAvailable)) {
+            throw "Full hibernation is required. In an administrator terminal run 'powercfg /hibernate /type full', then retry. Transit Mode does not change this setting."
+        }
         Remove-WatchdogTask
         Install-SensorLibrary
         $pawnIoInstalledVersion = Install-PawnIoDriver
 
         $originalScheme = Get-ActiveSchemeGuid
         $transitScheme  = [guid]::NewGuid().ToString()
-        $hibernateWasEnabled = Test-HibernationAvailable
-
-        if (-not $hibernateWasEnabled) {
-            Assert-HibernationStorageAvailable
-        }
 
         # Recovery information is persisted BEFORE the temporary plan is activated.
         $state = [ordered]@{
-            Version             = 2
+            Version             = 3
             Status              = "activating"
             StartedAt           = (Get-Date).ToString("o")
             OriginalScheme      = $originalScheme
             TransitScheme       = $transitScheme
-            HibernateWasEnabled = $hibernateWasEnabled
+            HibernateWasEnabled = $true
             WatchdogTask        = $WatchdogTaskName
             ControllerProcessId = $PID
         }
         Save-State $state
 
         try {
-            if (-not $hibernateWasEnabled) {
-                Enable-Hibernation
-            }
-
             Invoke-PowerCfg -PowerArgs @("/duplicatescheme", $originalScheme, $transitScheme) | Out-Null
 
             Invoke-PowerCfg -PowerArgs @(
@@ -740,9 +775,10 @@ switch ($Action) {
             Set-PowerValue $transitScheme $SubSleep     $SettingSleep      $SleepTimeout
             Set-PowerValue $transitScheme $SubSleep     $SettingWakeTimers $WakeTimers
 
+            # Arm independent monitoring before changing the active plan.
+            Start-Watchdog -TransitScheme $transitScheme | Out-Null
             Invoke-PowerCfg -PowerArgs @("/setactive", $transitScheme) | Out-Null
-
-            $watchdogStatus = Start-Watchdog -TransitScheme $transitScheme
+            $watchdogStatus = Wait-Watchdog -TransitScheme $transitScheme -States @("healthy", "hot")
 
             $state.Status = "active"
             Save-State $state
@@ -764,79 +800,15 @@ switch ($Action) {
         }
         catch {
             $activationError = $_
-            $rollbackErrors = @()
-            $watchdogRemoved = $false
-            $originalRestored = $false
-
-            try {
-                Remove-WatchdogTask
-                $watchdogRemoved = $true
-            }
+            try { Restore-TransitSession -State $state }
             catch {
-                $rollbackErrors += "watchdog cleanup: $($_.Exception.Message)"
+                Write-Warning "Automatic rollback was incomplete: $($_.Exception.Message). Recovery state retained at: $StateFile"
             }
-
-            try {
-                Invoke-PowerCfg -PowerArgs @("/setactive", $originalScheme) | Out-Null
-                $originalRestored = $true
-            }
-            catch {
-                $rollbackErrors += "power-plan restoration: $($_.Exception.Message)"
-            }
-
-            if ($originalRestored) {
-                try {
-                    if (Test-SchemeExists $transitScheme) {
-                        Invoke-PowerCfg -PowerArgs @("/delete", $transitScheme) | Out-Null
-                    }
-                }
-                catch {
-                    $rollbackErrors += "temporary-plan deletion: $($_.Exception.Message)"
-                }
-            }
-
-            if ($watchdogRemoved -and $originalRestored) {
-                try {
-                    Restore-HibernationState -WasEnabled $hibernateWasEnabled
-                }
-                catch {
-                    $rollbackErrors += "hibernation restoration: $($_.Exception.Message)"
-                }
-            }
-
-            if ($rollbackErrors.Count -eq 0) {
-                try {
-                    Remove-StateArtifacts
-                }
-                catch {
-                    $rollbackErrors += "state cleanup: $($_.Exception.Message)"
-                }
-            }
-
-            if ($rollbackErrors.Count -gt 0) {
-                Write-Warning "Automatic rollback was incomplete. Recovery state was retained at: $StateFile"
-                foreach ($rollbackError in $rollbackErrors) {
-                    Write-Warning "  $rollbackError"
-                }
-            }
-
             throw $activationError
         }
     }
 
     "off" {
-        if ($PSVersionTable.PSEdition -ne "Desktop") {
-            Restart-InWindowsPowerShell -Elevate:(-not (Test-IsAdministrator))
-        }
-
-        if (-not (Test-IsAdministrator)) {
-            Restart-InWindowsPowerShell -Elevate
-        }
-
-        if (Test-Path -LiteralPath $StateDir) {
-            Initialize-StateDirectory
-        }
-
         $state = Load-State
         if ($null -eq $state) {
             Remove-WatchdogTask
@@ -844,45 +816,23 @@ switch ($Action) {
             return
         }
 
-        $originalScheme = [string]$state.OriginalScheme
-        $transitScheme  = [string]$state.TransitScheme
-        $hibernateWasEnabled = Get-StateHibernateWasEnabled -State $state
-
-        if (-not (Test-SchemeExists $originalScheme)) {
-            throw "Original power scheme '$originalScheme' no longer exists. Recovery state retained at: $StateFile"
-        }
-
-        # Stop monitoring before intentionally changing the protected power plan.
-        Remove-WatchdogTask
-
-        # Restore first. Do not delete recovery state unless every cleanup step succeeds.
-        Invoke-PowerCfg -PowerArgs @("/setactive", $originalScheme) | Out-Null
-
-        if (Test-SchemeExists $transitScheme) {
-            Invoke-PowerCfg -PowerArgs @("/delete", $transitScheme) | Out-Null
-        }
-
-        Restore-HibernationState -WasEnabled $hibernateWasEnabled
-        Remove-StateArtifacts
+        Restore-TransitSession -State $state
 
         Write-Host ""
         Write-Host "Transit Mode: OFF" -ForegroundColor Green
         Write-Host "  Original power scheme restored."
         Write-Host "  Temporary Transit Mode scheme deleted."
         Write-Host "  Watchdog task removed."
-        Write-Host "  Original hibernation setting restored."
+        Write-Host "  Hibernation configuration preserved (legacy sessions restored)."
         Write-Host "  Recovery state removed."
         Write-Host "  Thermal history retained: $ThermalLogPattern"
     }
 
     "status" {
-        if ($PSVersionTable.PSEdition -ne "Desktop") {
-            Restart-InWindowsPowerShell
-        }
-
         $state = Load-State
         $activeScheme = Get-ActiveSchemeGuid
-        $watchdog = Get-WatchdogHealth
+        $expectedScheme = if ($null -ne $state) { [string]$state.TransitScheme } else { $null }
+        $watchdog = Get-WatchdogHealth -ExpectedScheme $expectedScheme
 
         if ($null -eq $state) {
             Write-Host "Transit Mode: OFF"
@@ -930,7 +880,7 @@ switch ($Action) {
             }
         }
         else {
-            Write-Host "Watchdog status:  missing"
+            Write-Host "Watchdog status:  $($watchdog.Reason)"
         }
 
         Write-Host "Recovery file:    $StateFile"
@@ -943,21 +893,11 @@ switch ($Action) {
     }
 
     "diagnose" {
-        if ($PSVersionTable.PSEdition -ne "Desktop") {
-            Restart-InWindowsPowerShell -Elevate:(-not (Test-IsAdministrator))
-        }
-
-        if (-not (Test-IsAdministrator)) {
-            Restart-InWindowsPowerShell -Elevate
-        }
-
         $diagnosticLines = @(
             "Transit Mode watchdog diagnostic"
         )
 
         try {
-            Initialize-StateDirectory
-
             if (-not (Test-Path -LiteralPath $WatchdogSourceScript)) {
                 throw "Watchdog script is missing: '$WatchdogSourceScript'."
             }
@@ -980,4 +920,9 @@ switch ($Action) {
             throw
         }
     }
+}
+
+}
+finally {
+    if ($null -ne $controllerLock) { $controllerLock.Dispose() }
 }

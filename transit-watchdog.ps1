@@ -27,6 +27,7 @@ $WatchdogLogFile    = Join-Path $StateDir "watchdog.log"
 $SensorDir          = Join-Path $StateDir "lib\v0.9.6"
 $SensorLibrary      = Join-Path $SensorDir "LibreHardwareMonitorLib.dll"
 $script:ThermalLogWarningIssued = $false
+$script:OriginalScheme = $null
 
 function Write-WatchdogLog {
     param([Parameter(Mandatory)][string]$Message)
@@ -125,7 +126,12 @@ function Write-WatchdogStatus {
 
     $tempFile = "$WatchdogStatusFile.$PID.tmp"
     $status | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tempFile -Encoding UTF8
-    Move-Item -LiteralPath $tempFile -Destination $WatchdogStatusFile -Force
+    if (Test-Path -LiteralPath $WatchdogStatusFile) {
+        [IO.File]::Replace($tempFile, $WatchdogStatusFile, [NullString]::Value)
+    }
+    else {
+        [IO.File]::Move($tempFile, $WatchdogStatusFile)
+    }
 }
 
 function Import-SensorLibrary {
@@ -262,42 +268,50 @@ function Get-ActiveSchemeGuid {
     throw "Could not determine the active power scheme GUID."
 }
 
-function Test-RecoveryStateRequiresFailSafe {
+function Get-SessionPhase {
+    $activeScheme = Get-ActiveSchemeGuid
     if (-not (Test-Path -LiteralPath $StateFile)) {
-        return $false
+        if ($activeScheme -eq $ExpectedScheme) { throw "Transit recovery state is missing." }
+        return "stopped"
     }
-
-    try {
-        $state = Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json
-        if (([string]$state.TransitScheme).ToLowerInvariant() -ne $ExpectedScheme.ToLowerInvariant()) {
-            return $false
-        }
-
-        if ([string]$state.Status -eq "active") {
-            return $true
-        }
-
-        if ([string]$state.Status -eq "activating") {
-            $controllerProperty = $state.PSObject.Properties["ControllerProcessId"]
-            if ($null -eq $controllerProperty) {
-                return $true
-            }
-
-            $controller = Get-Process -Id ([int]$controllerProperty.Value) -ErrorAction SilentlyContinue
-            return $null -eq $controller
-        }
-
-        return $false
+    $state = Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json
+    $original = [guid]::Empty
+    if ($state.TransitScheme -ne $ExpectedScheme -or
+        -not [guid]::TryParse([string]$state.OriginalScheme, [ref]$original) -or
+        $original -eq [guid]::Empty -or $original.ToString() -eq $ExpectedScheme -or
+        $state.Status -notin @("activating", "active", "stopping")) {
+        throw "Invalid watchdog recovery state."
     }
-    catch {
-        return $false
+    $script:OriginalScheme = $original.ToString()
+    if ($activeScheme -eq $ExpectedScheme) { return "monitoring" }
+    if ($activeScheme -eq $script:OriginalScheme) {
+        if ($state.Status -eq "activating") { return "armed" }
+        return "stopped"
+    }
+    throw "The expected Transit Mode power scheme is not active."
+}
+
+function Test-RecoveryStateRequiresFailSafe {
+    try { return (Get-SessionPhase) -eq "monitoring" }
+    catch { return $true }
+}
+
+function Restore-WatchdogOriginalPlan {
+    if (-not $script:OriginalScheme) {
+        # Also recover when configuration/sensor initialization failed early.
+        Get-SessionPhase | Out-Null
+    }
+    if (-not $script:OriginalScheme) { throw "Original power scheme is unavailable." }
+    $output = & powercfg.exe /setactive $script:OriginalScheme 2>&1
+    if ($LASTEXITCODE -ne 0 -or (Get-ActiveSchemeGuid) -ne $script:OriginalScheme) {
+        throw "Cannot restore original power scheme: $(($output | Out-String).Trim())"
     }
 }
 
 function Get-ThermalDecision {
     param(
         [Parameter(Mandatory)][double]$TemperatureC,
-        [Parameter(Mandatory)][DateTimeOffset]$Now,
+        [Parameter(Mandatory)][double]$Now,
         $HotSince
     )
 
@@ -320,7 +334,7 @@ function Get-ThermalDecision {
 
     $hotSeconds = $null
     if ($null -ne $HotSince) {
-        $hotSeconds = ($Now - $HotSince).TotalSeconds
+        $hotSeconds = $Now - $HotSince
     }
 
     if (($null -ne $hotSeconds) -and ($hotSeconds -ge $SustainedTemperatureTime)) {
@@ -353,10 +367,45 @@ function Initialize-NativePowerApi {
     }
 
     Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 
 public static class TransitModeWatchdogNativePower
 {
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    struct TokenPrivileges { public uint Count; public long Luid; public uint Attributes; }
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool LookupPrivilegeValue(string system, string name, out long luid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll,
+        ref TokenPrivileges privileges, uint length, IntPtr previous, IntPtr returned);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+
+    public static void EnableShutdownPrivilege()
+    {
+        const uint TOKEN_ADJUST_PRIVILEGES = 0x20, TOKEN_QUERY = 0x8;
+        const uint SE_PRIVILEGE_ENABLED = 0x2;
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            long luid;
+            if (!LookupPrivilegeValue(null, "SeShutdownPrivilege", out luid))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            var privileges = new TokenPrivileges { Count = 1, Luid = luid, Attributes = SE_PRIVILEGE_ENABLED };
+            bool adjusted = AdjustTokenPrivileges(token, false, ref privileges, 0, IntPtr.Zero, IntPtr.Zero);
+            int error = Marshal.GetLastWin32Error();
+            if (!adjusted || error != 0) throw new Win32Exception(error);
+        }
+        finally { CloseHandle(token); }
+    }
+
     [DllImport("powrprof.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.U1)]
     public static extern bool SetSuspendState(
@@ -367,6 +416,14 @@ public static class TransitModeWatchdogNativePower
 '@
 }
 
+function Invoke-NativeHibernate {
+    Initialize-NativePowerApi
+    [TransitModeWatchdogNativePower]::EnableShutdownPrivilege()
+    if (-not [TransitModeWatchdogNativePower]::SetSuspendState($true, $false, $true)) {
+        throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    }
+}
+
 function Invoke-EmergencyHibernate {
     param(
         [Parameter(Mandatory)][string]$Reason,
@@ -375,52 +432,49 @@ function Invoke-EmergencyHibernate {
     )
 
     Write-WatchdogLog "EMERGENCY: $Reason"
-
-    try {
-        Write-WatchdogStatus `
-            -State "hibernating" `
-            -CpuTemperatureC $CpuTemperatureC `
-            -Sensors $Sensors `
-            -Reason $Reason
-    }
-    catch {
-        Write-WatchdogLog "Could not write emergency status: $($_.Exception.Message)"
-    }
-
-    Initialize-NativePowerApi
-    # Suppress wake timers/events so an emergency-hibernated laptop does not
-    # resume unattended while it is still packed away.
-    $accepted = [TransitModeWatchdogNativePower]::SetSuspendState($true, $false, $true)
-    if (-not $accepted) {
-        $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        Write-WatchdogLog "SetSuspendState failed with Win32 error $nativeError; trying shutdown.exe /h."
-
-        $fallbackOutput = & shutdown.exe /h 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            $hibernateFailure = "SetSuspendState error: $nativeError; shutdown.exe /h: $(($fallbackOutput | Out-String).Trim())"
-            Write-WatchdogLog "Both hibernation methods failed ($hibernateFailure); forcing a safety shutdown."
-
-            $shutdownOutput = & shutdown.exe /s /f /t 0 /d p:0:0 /c "Transit Mode thermal watchdog emergency" 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                throw "Emergency hibernation and shutdown failed. $hibernateFailure; shutdown.exe /s: $(($shutdownOutput | Out-String).Trim())"
-            }
-
-            # Windows accepted the forced shutdown request. It can terminate this
-            # process before another durable status update would be meaningful.
-            exit 0
+    do {
+        $restored = $false
+        try {
+            Restore-WatchdogOriginalPlan
+            $restored = $true
+            Write-WatchdogLog "Original power scheme restored before emergency hibernation."
         }
+        catch { Write-WatchdogLog "Emergency plan restoration failed: $($_.Exception.Message)" }
 
-        # shutdown.exe has accepted the request. Keep the durable status as "hibernating".
-        exit 0
-    }
+        try { Write-WatchdogStatus -State "hibernating" -CpuTemperatureC $CpuTemperatureC -Sensors $Sensors -Reason $Reason }
+        catch { Write-WatchdogLog "Could not write emergency status: $($_.Exception.Message)" }
 
-    # SetSuspendState returns here after the machine resumes.
-    Write-WatchdogLog "System resumed after emergency hibernation. Transit Mode still requires 'off'."
-    Write-WatchdogStatus `
-        -State "resumed-after-emergency" `
-        -CpuTemperatureC $CpuTemperatureC `
-        -Sensors $Sensors `
-        -Reason $Reason
+        $resumed = $false
+        try {
+            Invoke-NativeHibernate
+            $resumed = $true
+        }
+        catch {
+            Write-WatchdogLog "Native hibernation failed: $($_.Exception.Message); trying shutdown.exe /h."
+            $fallbackOutput = & shutdown.exe /h 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-WatchdogLog "Hibernation failed: $(($fallbackOutput | Out-String).Trim()); forcing a safety shutdown."
+                $shutdownOutput = & shutdown.exe /s /f /t 0 /d p:0:0 /c "Transit Mode thermal watchdog emergency" 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Emergency hibernation and shutdown failed: $(($shutdownOutput | Out-String).Trim())"
+                }
+                # Stay alive until Windows terminates us; a canceled shutdown
+                # must not silently leave an unprotected Transit session.
+                Start-Sleep -Seconds 5
+            }
+        }
+        if ($restored) {
+            if ($resumed) {
+                Write-WatchdogLog "Resumed with original power scheme. Run 'transit-mode off' to clean up."
+                try { Write-WatchdogStatus -State "resumed-after-emergency" -CpuTemperatureC $CpuTemperatureC -Sensors $Sensors -Reason $Reason }
+                catch { Write-WatchdogLog "Could not write resume status: $($_.Exception.Message)" }
+            }
+            return
+        }
+        # A failed restore must not become a successful, unprotected exit after
+        # resume. Retry restoration and hibernation until the original plan is back.
+        Start-Sleep -Seconds 1
+    } while ($true)
 }
 
 function Invoke-Probe {
@@ -434,7 +488,7 @@ function Invoke-Probe {
     Write-Output "  Administrator: $isAdministrator"
     Write-Output "  PawnIO visible to LibreHardwareMonitor: $(Get-PawnIoDescription)"
 
-    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($StartupGraceSeconds)
+    $probeTimer = [Diagnostics.Stopwatch]::StartNew()
     do {
         $reading = Read-CpuTemperature -Computer $Computer
         if ($null -ne $reading) {
@@ -446,7 +500,7 @@ function Invoke-Probe {
         }
 
         Start-Sleep -Seconds 1
-    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+    } while ($probeTimer.Elapsed.TotalSeconds -lt $StartupGraceSeconds)
 
     $inventory = @(Get-CpuSensorInventory -Computer $Computer)
     $inventoryText = if ($inventory.Count -eq 0) {
@@ -474,6 +528,7 @@ $computer = $null
 $monitoringEstablished = $false
 
 try {
+    if ($Action -eq "run" -and (Get-SessionPhase) -eq "stopped") { return }
     # Load inside the fail-safe boundary: an invalid installed config during a
     # task restart must still trigger recovery for an active Transit session.
     . (Join-Path $PSScriptRoot "transit-config.ps1")
@@ -501,7 +556,7 @@ try {
     }
 
     $ExpectedScheme = $ExpectedScheme.ToLowerInvariant()
-    $startupDeadline = [DateTimeOffset]::UtcNow.AddSeconds($StartupGraceSeconds)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     $reading = $null
 
     do {
@@ -518,41 +573,24 @@ try {
 
         Write-WatchdogStatus -State "starting" -Reason "Waiting for a valid CPU temperature."
         Start-Sleep -Seconds 1
-    } while ([DateTimeOffset]::UtcNow -lt $startupDeadline)
+    } while ($clock.Elapsed.TotalSeconds -lt $StartupGraceSeconds)
 
     if ($null -eq $reading) {
         throw "No valid CPU temperature appeared within $StartupGraceSeconds seconds."
     }
 
-    if ((Get-ActiveSchemeGuid) -ne $ExpectedScheme) {
-        throw "The expected Transit Mode power scheme is not active."
-    }
-
-    $monitoringEstablished = $true
-    $startedAt = [DateTimeOffset]::UtcNow
-    $lastLoopAt = $startedAt
-    $lastPeriodicLogAt = [DateTimeOffset]::MinValue
+    $monitoringEstablished = (Get-SessionPhase) -eq "monitoring"
+    $lastLoopAt = $clock.Elapsed.TotalSeconds
+    $lastPeriodicLogAt = -60
     $hotSince = $null
     $missingSince = $null
 
     Write-WatchdogLog ("Watchdog started. CPU={0:N1} C; sustained={1} C/{2}s; critical={3} C." -f $reading.MaximumC, $SustainedTemperatureC, $SustainedTemperatureTime, $CriticalTemperatureC)
 
     while ($true) {
-        $now = [DateTimeOffset]::UtcNow
-        $loopGap = ($now - $lastLoopAt).TotalSeconds
-        $lastLoopAt = $now
-
-        if ($loopGap -gt $ResumeGapSeconds) {
-            $hotSince = $null
-            $missingSince = $null
-            Write-WatchdogLog ("Long scheduling gap detected ({0:N0}s); thermal timers reset." -f $loopGap)
-        }
-
-        if ((Get-ActiveSchemeGuid) -ne $ExpectedScheme) {
-            Invoke-EmergencyHibernate -Reason "The Transit Mode power scheme stopped being active."
-            exit 0
-        }
-
+        $phase = Get-SessionPhase
+        if ($phase -eq "stopped") { return }
+        $monitoringEstablished = $phase -eq "monitoring"
         try {
             $reading = Read-CpuTemperature -Computer $computer
         }
@@ -561,12 +599,25 @@ try {
             Write-WatchdogLog "Sensor update failed: $($_.Exception.Message)"
         }
 
+        $now = $clock.Elapsed.TotalSeconds
+        $loopGap = $now - $lastLoopAt
+        $lastLoopAt = $now
+        if ($monitoringEstablished -and $loopGap -gt $ResumeGapSeconds) {
+            Invoke-EmergencyHibernate -Reason "Temperature monitoring gap exceeded $ResumeGapSeconds seconds."
+            return
+        }
+        if ($phase -eq "armed") {
+            if ($null -eq $reading) { throw "CPU sensor unavailable while arming the watchdog." }
+            Write-WatchdogStatus -State "armed" -CpuTemperatureC $reading.MaximumC -Sensors $reading.Sensors
+            Start-Sleep -Milliseconds 250
+            continue
+        }
         if ($null -eq $reading) {
             if ($null -eq $missingSince) {
                 $missingSince = $now
             }
 
-            $missingSeconds = ($now - $missingSince).TotalSeconds
+            $missingSeconds = $now - $missingSince
             Write-WatchdogStatus -State "sensor-missing" -Reason ("No valid CPU temperature for {0:N0}s." -f $missingSeconds)
             Write-ThermalSample -State "sensor-missing"
 
@@ -609,7 +660,7 @@ try {
                 -State $decision.State `
                 -HotSeconds $decision.HotSeconds
 
-            if (($now - $lastPeriodicLogAt).TotalSeconds -ge 60) {
+            if (($now - $lastPeriodicLogAt) -ge 60) {
                 Write-WatchdogLog ("CPU={0:N1} C; state={1}." -f $temperature, $decision.State)
                 $lastPeriodicLogAt = $now
             }
@@ -639,11 +690,9 @@ catch {
         }
     }
 
-    try {
-        Write-WatchdogStatus -State "failed" -Reason $message
-    }
-    catch {
-        # The caller will also detect a missing/stale readiness file.
+    if ($Action -eq "run") {
+        try { Write-WatchdogStatus -State "failed" -Reason $message }
+        catch { }
     }
     throw
 }

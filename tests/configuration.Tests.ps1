@@ -109,24 +109,25 @@ Describe "Script configuration integration" {
         $SustainedTemperatureC = $config.sustainedTemperatureC
         $TemperatureResetC = $config.temperatureResetC
         $SustainedTemperatureTime = $config.sustainedTemperatureTimeSeconds
-        $now = [DateTimeOffset]::Parse("2026-01-01T00:00:00Z")
+        $now = 100.0
         (Get-ThermalDecision 84 $now $null).Action | Should Be "continue"
         (Get-ThermalDecision 85 $now $null).Action | Should Be "hibernate"
-        (Get-ThermalDecision 78 $now $now.AddSeconds(-30)).Action | Should Be "hibernate"
-        (Get-ThermalDecision 75 $now $now.AddSeconds(-30)).Action | Should Be "continue"
+        (Get-ThermalDecision 78 $now ($now - 30)).Action | Should Be "hibernate"
+        (Get-ThermalDecision 75 $now ($now - 30)).Action | Should Be "continue"
     }
 }
 
 Describe "Watchdog installation and recovery" {
-    BeforeEach {
-        # Load controller setup/functions, then mock only system boundaries.
+    # Load once: redefining functions after Pester mocks them replaces its wrappers.
+    # Load controller setup/functions, then mock only system boundaries.
         $tokens = $null
         $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repo "transit-mode.ps1"), [ref]$tokens, [ref]$errors)
-        $actions = $ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.SwitchStatementAst] }
-        $setup = $ast.Extent.Text.Substring(0, $actions.Extent.StartOffset)
+        $actions = $ast.Find({ param($node) $node -is [Management.Automation.Language.SwitchStatementAst] }, $true)
+        $setup = $ast.Extent.Text.Substring(0, $ast.Extent.Text.IndexOf('# ---- Actions'))
         $setup = $setup.Replace('$PSScriptRoot', "'" + $repo.Replace("'", "''") + "'")
         . ([scriptblock]::Create($setup)) -Action status
+    BeforeEach {
         $StateDir = Join-Path $TestDrive "installed"
         New-Item $StateDir -ItemType Directory -Force | Out-Null
         $StateFile = Join-Path $StateDir "state.json"
@@ -140,12 +141,15 @@ Describe "Watchdog installation and recovery" {
         # Task constructors create in-memory CIM objects; only registration and
         # execution touch Task Scheduler and need doubles.
         Mock Register-ScheduledTask {}
+        Mock Grant-WatchdogTaskReadAccess {}
+        Mock Get-WatchdogTask { [pscustomobject]@{ State = "Running" } }
     }
 
     It "installs the validated snapshot and all files needed by the worker" {
         $WatchdogConfig.criticalTemperatureC = 86
         Mock Start-ScheduledTask {
-            @{ ExpectedScheme = "test-scheme"; State = "healthy" } |
+            @{ ExpectedScheme = "test-scheme"; State = "armed"; UpdatedAt = [DateTimeOffset]::UtcNow.ToString("o");
+                PollIntervalSeconds = 5; CpuTemperatureC = 45; Reason = $null } |
                 ConvertTo-Json | Set-Content $WatchdogStatusFile
         }
         Start-Watchdog -TransitScheme "test-scheme" | Out-Null
@@ -154,6 +158,7 @@ Describe "Watchdog installation and recovery" {
         (Read-TransitConfig $WatchdogInstalledConfig watchdog).criticalTemperatureC | Should Be 86
         Test-Path $WatchdogInstalledScript | Should Be $true
         Assert-MockCalled Register-ScheduledTask -Times 1 -Exactly
+        Assert-MockCalled Grant-WatchdogTaskReadAccess -Times 1 -Exactly
     }
 
     It "uses the running worker's polling interval for health" {
@@ -162,17 +167,21 @@ Describe "Watchdog installation and recovery" {
             State = "healthy"
             UpdatedAt = [DateTimeOffset]::UtcNow.AddSeconds(-20).ToString("o")
             PollIntervalSeconds = 10
+            ExpectedScheme = "test-scheme"
+            CpuTemperatureC = 45
+            Reason = $null
         } | ConvertTo-Json | Set-Content $WatchdogStatusFile
-        (Get-WatchdogHealth).IsReady | Should Be $true
+        (Get-WatchdogHealth -ExpectedScheme "test-scheme").IsReady | Should Be $true
     }
 
     It "restores the saved plan without reading editable configuration" {
         $Action = "off"
         Mock Test-IsAdministrator { $true }
         Mock Initialize-StateDirectory {}
-        Mock Load-State { [pscustomobject]@{ OriginalScheme = "original"; TransitScheme = "temporary"; HibernateWasEnabled = $true } }
+        Mock Load-State { [pscustomobject]@{ OriginalScheme = "original"; TransitScheme = "temporary"; HibernateWasEnabled = $true; Version = 3; Status = "active" } }
         Mock Test-SchemeExists { $true }
         Mock Invoke-PowerCfg {}
+        Mock Get-ActiveSchemeGuid { "original" }
         Mock Restore-HibernationState {}
         Mock Remove-StateArtifacts {}
         . ([scriptblock]::Create($actions.Extent.Text))
