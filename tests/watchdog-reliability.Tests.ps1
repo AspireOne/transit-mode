@@ -30,9 +30,16 @@ function Read-CpuTemperature {
     if ($script:case -eq "gap" -and $script:samples -eq 2) {
         [Threading.Thread]::Sleep(3100)
     }
-    if ($script:case -eq "missing" -and $script:samples -gt 1) { return $null }
-    $temperature = if ($script:case -eq "armed" -or $script:samples -eq 1) { 45 } else { 90 }
+    if ($script:case -in @("missing", "battery-missing-sensor") -and $script:samples -gt 1) { return $null }
+    $temperature = if ($script:case -eq "armed" -or $script:case -like "battery*" -or $script:samples -eq 1) { 45 } else { 90 }
     return [pscustomobject]@{ MaximumC = $temperature; Sensors = @("test"); Readings = @() }
+}
+function Read-SystemPowerStatus {
+    if ($script:case -eq "battery-failure") { throw "Injected power-status failure" }
+    if ($script:case -like "battery*") {
+        return Get-Content (Join-Path $PSScriptRoot "power-status.json") -Raw | ConvertFrom-Json
+    }
+    return [pscustomobject]@{ ACLineStatus = 1; BatteryFlag = 0; BatteryLifePercent = 100 }
 }
 function powercfg.exe {
     param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
@@ -60,7 +67,7 @@ function shutdown.exe {
 function Start-Sleep {
     param($Seconds, $Milliseconds)
     if ($script:case -eq "missing") { [Threading.Thread]::Sleep(1050); return }
-    if ($script:case -eq "armed") {
+    if ($script:case -eq "armed" -or $script:case -like "battery*") {
         $status = Get-Content $WatchdogStatusFile -Raw | ConvertFrom-Json
         Add-Content $events $status.State
         if ($status.State -eq "armed") { $script:activePlan = $ExpectedScheme }
@@ -81,6 +88,82 @@ if ($script:case -in @("armed", "stopped")) {
         @{
             Status = "active"; TransitScheme = $transit; OriginalScheme = $original
         } | ConvertTo-Json | Set-Content (Join-Path $sandbox "state.json")
+    }
+
+    It "restores and hibernates on battery at <Percent>%" -TestCases @(
+        @{ Percent = 6 }, @{ Percent = 5 }, @{ Percent = 0 }
+    ) {
+        param($Percent)
+        Set-Content (Join-Path $sandbox "case.txt") "battery-low"
+        @{ ACLineStatus = 0; BatteryFlag = 4; BatteryLifePercent = $Percent } |
+            ConvertTo-Json | Set-Content (Join-Path $sandbox "power-status.json")
+
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+
+        $LASTEXITCODE | Should Be 0
+        $events = @(Get-Content (Join-Path $sandbox "events.txt"))
+        $events[0] | Should Be "restored"
+        $events[1] | Should Be "hibernate:$original"
+        $events.Count | Should Be 2
+        $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
+        $status.State | Should Be "resumed-after-emergency"
+        $status.Reason | Should Match "Battery charge reached $Percent%"
+        $status.Reason | Should Match "threshold: 6%"
+    }
+
+    It "continues monitoring with <Case>" -TestCases @(
+        @{ Case = "charge above threshold"; AC = 0; Percent = 7; Flag = 0 },
+        @{ Case = "low charge on AC"; AC = 1; Percent = 6; Flag = 8 },
+        @{ Case = "empty charge on AC"; AC = 1; Percent = 0; Flag = 0 },
+        @{ Case = "unknown power source"; AC = 255; Percent = 6; Flag = 0 },
+        @{ Case = "unknown charge"; AC = 0; Percent = 255; Flag = 255 },
+        @{ Case = "no battery"; AC = 0; Percent = 0; Flag = 128 }
+    ) {
+        param($Case, $AC, $Percent, $Flag)
+        Set-Content (Join-Path $sandbox "case.txt") "battery-continue"
+        @{ ACLineStatus = $AC; BatteryFlag = $Flag; BatteryLifePercent = $Percent } |
+            ConvertTo-Json | Set-Content (Join-Path $sandbox "power-status.json")
+
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+
+        $LASTEXITCODE | Should Be 0
+        $events = @(Get-Content (Join-Path $sandbox "events.txt"))
+        $events.Count | Should Be 1
+        $events[0] | Should Be "healthy"
+        (Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json).State | Should Be "healthy"
+    }
+
+    It "uses the configured battery threshold even when temperature readings disappear" {
+        $configPath = Join-Path $sandbox "transit-watchdog.config.json"
+        $config = Get-Content $configPath -Raw | ConvertFrom-Json
+        $config.lowBatteryPercent = 10
+        $config | ConvertTo-Json | Set-Content $configPath
+        Set-Content (Join-Path $sandbox "case.txt") "battery-missing-sensor"
+        @{ ACLineStatus = 0; BatteryFlag = 255; BatteryLifePercent = 10 } |
+            ConvertTo-Json | Set-Content (Join-Path $sandbox "power-status.json")
+
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+
+        $LASTEXITCODE | Should Be 0
+        $events = @(Get-Content (Join-Path $sandbox "events.txt"))
+        $events[0] | Should Be "restored"
+        $events[1] | Should Be "hibernate:$original"
+        $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
+        $status.Reason | Should Match "Battery charge reached 10%"
+        $status.Reason | Should Match "threshold: 10%"
+    }
+
+    It "restores and hibernates if the Windows power-status call fails" {
+        Set-Content (Join-Path $sandbox "case.txt") "battery-failure"
+
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+
+        $LASTEXITCODE | Should Be 0
+        $events = @(Get-Content (Join-Path $sandbox "events.txt"))
+        $events[0] | Should Be "restored"
+        $events[1] | Should Be "hibernate:$original"
+        $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
+        $status.Reason | Should Match "Injected power-status failure"
     }
 
     It "restores the original plan before emergency hibernation and exits safely after resume" {
@@ -159,5 +242,22 @@ if ($script:case -in @("armed", "stopped")) {
         $LASTEXITCODE | Should Be 0
         $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
         $status.Reason | Should Match "monitoring was unavailable"
+    }
+}
+
+Describe "Native Windows power status" {
+    It "reads the real power status without changing power settings" {
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repo "transit-watchdog.ps1"), [ref]$tokens, [ref]$errors)
+        foreach ($name in @("Initialize-NativePowerApi", "Read-SystemPowerStatus")) {
+            $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $false)
+            . ([scriptblock]::Create($function.Extent.Text))
+        }
+
+        $status = Read-SystemPowerStatus
+
+        $status | Should Not BeNullOrEmpty
+        ($status.ACLineStatus -in @(0, 1, 255)) | Should Be $true
+        ($status.BatteryLifePercent -le 100 -or $status.BatteryLifePercent -eq 255) | Should Be $true
     }
 }

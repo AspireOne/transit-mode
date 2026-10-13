@@ -204,6 +204,11 @@ If needed, RyzenAdj also exposes a maximum GFX clock control.
 
 ## Monitoring / watchdog
 
+Battery charge and AC status come from the native Windows
+[`GetSystemPowerStatus`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getsystempowerstatus)
+API, separate from LibreHardwareMonitor. This avoids additional hardware probing.
+See [Low battery](README.md#low-battery) for the policy and unavailable-reading behavior.
+
 The watchdog uses the LibreHardwareMonitor library to read AMD's CPU `Tctl/Tdie` control sensor. Windows' generic `Win32_TemperatureProbe` is not suitable: Microsoft documents that its real-time `CurrentReading` is not populated. Only CPU monitoring is enabled, which avoids unrelated motherboard/EC probing and keeps the worker small.
 
 Reliability behavior:

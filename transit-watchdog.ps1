@@ -19,6 +19,7 @@ $SustainedTemperatureC = $null
 $SustainedTemperatureTime = $null
 $CriticalTemperatureC = $null
 $MissingSensorGraceSeconds = $null
+$LowBatteryPercent = $null
 
 $StateDir          = Join-Path $env:ProgramData "TransitMode"
 $StateFile         = Join-Path $StateDir "state.json"
@@ -373,6 +374,21 @@ using System.Runtime.InteropServices;
 
 public static class TransitModeWatchdogNativePower
 {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SystemPowerStatus
+    {
+        public byte ACLineStatus;
+        public byte BatteryFlag;
+        public byte BatteryLifePercent;
+        public byte SystemStatusFlag;
+        public uint BatteryLifeTime;
+        public uint BatteryFullLifeTime;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetSystemPowerStatus(out SystemPowerStatus status);
+
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     struct TokenPrivileges { public uint Count; public long Luid; public uint Attributes; }
     [DllImport("advapi32.dll", SetLastError = true)]
@@ -414,6 +430,31 @@ public static class TransitModeWatchdogNativePower
         [MarshalAs(UnmanagedType.U1)] bool disableWakeEvents);
 }
 '@
+}
+
+function Read-SystemPowerStatus {
+    Initialize-NativePowerApi
+    $status = [TransitModeWatchdogNativePower+SystemPowerStatus]::new()
+    if (-not [TransitModeWatchdogNativePower]::GetSystemPowerStatus([ref]$status)) {
+        throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    }
+    return $status
+}
+
+function Get-LowBatteryReason {
+    param([Parameter(Mandatory)]$PowerStatus)
+
+    # SYSTEM_POWER_STATUS uses sentinel values, not percentages, for unknown data.
+    $acOffline = 0
+    $unknownBatteryFlag = 255
+    $noSystemBatteryFlag = 128
+    if ($PowerStatus.ACLineStatus -ne $acOffline -or
+        ($PowerStatus.BatteryFlag -ne $unknownBatteryFlag -and
+            ($PowerStatus.BatteryFlag -band $noSystemBatteryFlag) -ne 0) -or
+        $PowerStatus.BatteryLifePercent -gt $LowBatteryPercent) {
+        return $null
+    }
+    return "Battery charge reached {0}% while on battery power (hibernation threshold: {1}%)." -f $PowerStatus.BatteryLifePercent, $LowBatteryPercent
 }
 
 function Invoke-NativeHibernate {
@@ -538,6 +579,7 @@ try {
     $SustainedTemperatureTime = $config.sustainedTemperatureTimeSeconds
     $TemperatureResetC = $config.temperatureResetC
     $CriticalTemperatureC = $config.criticalTemperatureC
+    $LowBatteryPercent = $config.lowBatteryPercent
     $MissingSensorGraceSeconds = $config.missingSensorGraceSeconds
     $StartupGraceSeconds = $config.startupGraceSeconds
     $ResumeGapSeconds = $config.resumeGapSeconds
@@ -585,7 +627,7 @@ try {
     $hotSince = $null
     $missingSince = $null
 
-    Write-WatchdogLog ("Watchdog started. CPU={0:N1} C; sustained={1} C/{2}s; critical={3} C." -f $reading.MaximumC, $SustainedTemperatureC, $SustainedTemperatureTime, $CriticalTemperatureC)
+    Write-WatchdogLog ("Watchdog started. CPU={0:N1} C; sustained={1} C/{2}s; critical={3} C; low battery={4}%." -f $reading.MaximumC, $SustainedTemperatureC, $SustainedTemperatureTime, $CriticalTemperatureC, $LowBatteryPercent)
 
     while ($true) {
         $phase = Get-SessionPhase
@@ -611,6 +653,11 @@ try {
             Write-WatchdogStatus -State "armed" -CpuTemperatureC $reading.MaximumC -Sensors $reading.Sensors
             Start-Sleep -Milliseconds 250
             continue
+        }
+        $batteryReason = Get-LowBatteryReason -PowerStatus (Read-SystemPowerStatus)
+        if ($batteryReason) {
+            Invoke-EmergencyHibernate -Reason $batteryReason
+            return
         }
         if ($null -eq $reading) {
             if ($null -eq $missingSince) {

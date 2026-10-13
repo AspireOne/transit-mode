@@ -39,6 +39,7 @@ function Read-TransitConfig {
             sustainedTemperatureTimeSeconds = @(1, [int]::MaxValue)
             temperatureResetC = @(1, 200)
             criticalTemperatureC = @(1, 200)
+            lowBatteryPercent = @(1, 100)
             missingSensorGraceSeconds = @(1, [int]::MaxValue)
             startupGraceSeconds = @(1, [int]::MaxValue)
             resumeGapSeconds = @(1, [int]::MaxValue)

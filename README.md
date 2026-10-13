@@ -66,7 +66,7 @@ if Transit Mode is already active, run `off` and then `on` to apply changes.
 `diagnose` validates the files and probes sensors using the source watchdog config.
 
 - [transit-mode.config.json](transit-mode.config.json): CPU limits, power-plan behavior, and watchdog startup timeout.
-- [transit-watchdog.config.json](transit-watchdog.config.json): thermal thresholds, polling, grace periods, and log retention.
+- [transit-watchdog.config.json](transit-watchdog.config.json): thermal and battery thresholds, polling, grace periods, and log retention.
 
 All fields are required integers; unknown fields, invalid values, and malformed
 JSON cause an error before activation changes the system. JSON does not allow comments.
@@ -94,6 +94,22 @@ time. Intervals use a monotonic clock, so wall-clock changes cannot extend them.
 Numeric validation checks consistency; it does not establish safe thermal limits
 for a particular laptop.
 
+### Low battery
+
+`lowBatteryPercent` is the battery-charge threshold (integer 1–100; default 6%).
+At or below it while running on battery, the watchdog restores the original plan
+and hibernates through the existing emergency recovery path. Run `off` after
+resuming to finish cleanup. AC power, an absent battery, or an unknown power
+source or charge percentage does not trigger low-battery hibernation. Failure of
+the Windows power-status API triggers the existing watchdog-failure recovery.
+
+Windows' battery notifications and critical-battery actions remain enabled as a
+fallback. Set this threshold above the critical-battery level of the original
+power plan; the temporary plan inherits those settings. Polling cannot prevent
+Windows acting first if charge readings jump or monitoring is suspended.
+
+### Session configuration
+
 Activation saves the validated watchdog settings to
 `C:\ProgramData\TransitMode\transit-watchdog.config.json`, alongside the installed
 worker and shared loader. Editing the source files cannot change that session,
@@ -116,6 +132,7 @@ Invoke-Pester .\tests -EnableExit
 - Automatic hibernation at 82 °C, or after 30 seconds in the 80 °C hot band
 - Automatic hibernation if temperature readings disappear for 22 seconds
 - Emergency recovery after a monitoring gap longer than 20 seconds
+- [Low-battery hibernation](#low-battery)
 - Watchdog armed before the temporary plan is activated
 - Native hibernation requests wake-event suppression; the shutdown.exe fallback does not provide that option
 - Original settings restored by `off`

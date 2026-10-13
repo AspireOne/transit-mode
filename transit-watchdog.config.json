@@ -4,6 +4,7 @@
   "sustainedTemperatureTimeSeconds": 30,
   "temperatureResetC": 75,
   "criticalTemperatureC": 82,
+  "lowBatteryPercent": 6,
   "missingSensorGraceSeconds": 22,
   "startupGraceSeconds": 30,
   "resumeGapSeconds": 20,

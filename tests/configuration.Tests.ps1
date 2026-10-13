@@ -40,6 +40,23 @@ Describe "Editable configuration" {
         }
     }
 
+    It "preserves an edited low-battery threshold" {
+        $watchdog.lowBatteryPercent = 10
+        $watchdog | ConvertTo-Json | Set-Content $path
+        (Read-TransitConfig $path watchdog).lowBatteryPercent | Should Be 10
+    }
+
+    It "requires a valid integer low-battery threshold" {
+        foreach ($value in @("6", $true, $null, 6.5, 0, 101)) {
+            $watchdog.lowBatteryPercent = $value
+            $watchdog | ConvertTo-Json | Set-Content $path
+            { Read-TransitConfig $path watchdog } | Should Throw "lowBatteryPercent"
+        }
+        $watchdog.PSObject.Properties.Remove("lowBatteryPercent")
+        $watchdog | ConvertTo-Json | Set-Content $path
+        { Read-TransitConfig $path watchdog } | Should Throw "lowBatteryPercent"
+    }
+
     It "rejects a CPU minimum above the maximum" {
         $mode.cpuMinPercent = 60
         $mode.cpuMaxPercent = 45
@@ -147,6 +164,7 @@ Describe "Watchdog installation and recovery" {
 
     It "installs the validated snapshot and all files needed by the worker" {
         $WatchdogConfig.criticalTemperatureC = 86
+        $WatchdogConfig.lowBatteryPercent = 9
         Mock Start-ScheduledTask {
             @{ ExpectedScheme = "test-scheme"; State = "armed"; UpdatedAt = [DateTimeOffset]::UtcNow.ToString("o");
                 PollIntervalSeconds = 5; CpuTemperatureC = 45; Reason = $null } |
@@ -156,6 +174,7 @@ Describe "Watchdog installation and recovery" {
         $WatchdogConfig.criticalTemperatureC = 90
         . (Join-Path $StateDir "transit-config.ps1")
         (Read-TransitConfig $WatchdogInstalledConfig watchdog).criticalTemperatureC | Should Be 86
+        (Read-TransitConfig $WatchdogInstalledConfig watchdog).lowBatteryPercent | Should Be 9
         Test-Path $WatchdogInstalledScript | Should Be $true
         Assert-MockCalled Register-ScheduledTask -Times 1 -Exactly
         Assert-MockCalled Grant-WatchdogTaskReadAccess -Times 1 -Exactly
