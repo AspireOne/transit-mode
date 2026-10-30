@@ -667,7 +667,8 @@ function Get-WatchdogHealth {
             }
             if ($status.State -in @("armed", "healthy", "hot")) {
                 $temperature = $status.CpuTemperatureC
-                if (($temperature -isnot [int] -and $temperature -isnot [long] -and $temperature -isnot [double]) -or
+                # Windows PowerShell deserializes fractional JSON numbers as Decimal.
+                if (($temperature -isnot [int] -and $temperature -isnot [long] -and $temperature -isnot [double] -and $temperature -isnot [decimal]) -or
                     [double]::IsNaN($temperature) -or $temperature -le 0 -or $temperature -gt 200) {
                     throw "Status has no valid CPU temperature."
                 }

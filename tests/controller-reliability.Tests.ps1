@@ -141,6 +141,24 @@ Describe "Controller reliability" {
         Test-Path "$StateFile.tmp" | Should Be $false
     }
 
+    It "accepts fractional CPU temperatures from armed and monitoring heartbeats" {
+        foreach ($phase in @("armed", "healthy")) {
+            $heartbeat = @{
+                State = $phase; UpdatedAt = [DateTimeOffset]::UtcNow.ToString("o")
+                ExpectedScheme = $state.TransitScheme; PollIntervalSeconds = 5
+                CpuTemperatureC = 46.4; Reason = $null
+            }
+            $heartbeat | ConvertTo-Json | Set-Content $WatchdogStatusFile
+
+            $health = Get-WatchdogHealth -ExpectedScheme $state.TransitScheme
+
+            $health.IsFresh | Should Be $true
+            $health.Status.State | Should Be $phase
+            $health.Status.CpuTemperatureC | Should Be 46.4
+            $health.IsReady | Should Be ($phase -eq "healthy")
+        }
+    }
+
     It "rejects future, stale, foreign, and incomplete heartbeats" {
         foreach ($kind in @("future", "stale", "foreign", "incomplete", "invalid-temperature")) {
             $heartbeat = @{
