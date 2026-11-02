@@ -230,7 +230,13 @@ These are conservative project thresholds, not manufacturer limits. AMD specifie
 Emergency recovery restores the original plan before attempting hibernation, so resume does not leave the Transit plan without monitoring. This briefly restores normal CPU settings before hibernation. If plan restoration fails, the worker keeps retrying restoration and hibernation after resume. Recovery files and the task remain for `off` to clean up.
 
 Controller mutations hold an exclusive file lock in the protected state directory.
-Recovery state and heartbeat updates replace existing files atomically. Health
+Recovery state and heartbeat updates replace existing files atomically. Heartbeat
+publication briefly retries file-contention failures because a reader or scanner
+can temporarily prevent replacement. Retryable errors must preserve both file
+names; other replacement errors can leave a partially completed operation (see Microsoft's
+[ReplaceFile contract](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew)).
+Retries must stay short enough to avoid materially delaying monitoring or
+hibernation. Persistent or other failures still reach emergency recovery. Health
 requires a running task, matching session, plausible temperature, and a heartbeat
 whose age is nonnegative and no more than three polling intervals.
 

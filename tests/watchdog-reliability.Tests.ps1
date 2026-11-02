@@ -31,7 +31,12 @@ function Read-CpuTemperature {
         [Threading.Thread]::Sleep(3100)
     }
     if ($script:case -in @("missing", "battery-missing-sensor") -and $script:samples -gt 1) { return $null }
-    $temperature = if ($script:case -eq "armed" -or $script:case -like "battery*" -or $script:samples -eq 1) { 45 } else { 90 }
+    if ($script:case -like "status-*" -and $script:samples -eq 2) {
+        Set-Content $WatchdogStatusFile '{"State":"previous"}'
+        $script:statusReader = [IO.File]::Open($WatchdogStatusFile,
+            [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    }
+    $temperature = if ($script:case -eq "armed" -or $script:case -like "battery*" -or $script:case -like "status-*" -or $script:samples -eq 1) { 45 } else { 90 }
     return [pscustomobject]@{ MaximumC = $temperature; Sensors = @("test"); Readings = @() }
 }
 function Read-SystemPowerStatus {
@@ -58,6 +63,7 @@ function powercfg.exe {
 function Invoke-NativeHibernate {
     if ($script:case -eq "fallback") { throw "Injected native failure" }
     Add-Content $events "hibernate:$script:activePlan"
+    if ($script:case -eq "status-persistent") { $script:statusReader.Dispose() }
 }
 function shutdown.exe {
     param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
@@ -66,8 +72,14 @@ function shutdown.exe {
 }
 function Start-Sleep {
     param($Seconds, $Milliseconds)
+    if ($script:case -like "status-*" -and $Milliseconds -gt 0) {
+        $status = Get-Content $WatchdogStatusFile -Raw | ConvertFrom-Json
+        Add-Content $events "retry:$($status.State)"
+        if ($script:case -eq "status-transient") { $script:statusReader.Dispose() }
+        return
+    }
     if ($script:case -eq "missing") { [Threading.Thread]::Sleep(1050); return }
-    if ($script:case -eq "armed" -or $script:case -like "battery*") {
+    if ($script:case -eq "armed" -or $script:case -like "battery*" -or $script:case -like "status-*") {
         $status = Get-Content $WatchdogStatusFile -Raw | ConvertFrom-Json
         Add-Content $events $status.State
         if ($status.State -eq "armed") { $script:activePlan = $ExpectedScheme }
@@ -88,6 +100,40 @@ if ($script:case -in @("armed", "stopped")) {
         @{
             Status = "active"; TransitScheme = $transit; OriginalScheme = $original
         } | ConvertTo-Json | Set-Content (Join-Path $sandbox "state.json")
+    }
+
+    It "continues monitoring after a reader briefly blocks atomic status replacement" {
+        Set-Content (Join-Path $sandbox "case.txt") "status-transient"
+
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+
+        $LASTEXITCODE | Should Be 0
+        $events = @(Get-Content (Join-Path $sandbox "events.txt"))
+        ($events -join ",") | Should Be "retry:previous,healthy"
+        $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
+        $status.State | Should Be "healthy"
+        $status.CpuTemperatureC | Should Be 45
+        $status.ExpectedScheme | Should Be $transit
+        @(Get-ChildItem $sandbox -Filter "watchdog-status.json.*.tmp").Count | Should Be 0
+        Get-Content (Join-Path $sandbox "watchdog.log") -Raw | Should Match "Status update recovered"
+    }
+
+    It "restores and hibernates after bounded retries even if emergency status is also locked" {
+        Set-Content (Join-Path $sandbox "case.txt") "status-persistent"
+
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+
+        $LASTEXITCODE | Should Be 0
+        $events = @(Get-Content (Join-Path $sandbox "events.txt"))
+        $retries = @($events | Where-Object { $_ -like "retry:*" })
+        $retries.Count | Should BeGreaterThan 0
+        ($retries.Count -le 8) | Should Be $true
+        @($retries | Where-Object { $_ -ne "retry:previous" }).Count | Should Be 0
+        (($events | Where-Object { $_ -notlike "retry:*" }) -join ",") | Should Be "restored,hibernate:$original"
+        $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
+        $status.State | Should Be "resumed-after-emergency"
+        $status.Reason | Should Match "temperature watchdog failed"
+        Get-Content (Join-Path $sandbox "watchdog.log") -Raw | Should Match "Status update failed after"
     }
 
     It "restores and hibernates on battery at <Percent>%" -TestCases @(

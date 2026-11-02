@@ -30,6 +30,12 @@ $SensorLibrary      = Join-Path $SensorDir "LibreHardwareMonitorLib.dll"
 $script:ThermalLogWarningIssued = $false
 $script:OriginalScheme = $null
 
+$StatusWriteMaxAttempts = 5
+$StatusWriteRetryMilliseconds = 100
+# Win32 sharing violation, lock violation, and unable to remove replaced file.
+# These leave both file names intact, so retrying the atomic replacement is safe.
+$StatusWriteRetryableErrors = @(32, 33, 1175)
+
 function Write-WatchdogLog {
     param([Parameter(Mandatory)][string]$Message)
 
@@ -127,11 +133,34 @@ function Write-WatchdogStatus {
 
     $tempFile = "$WatchdogStatusFile.$PID.tmp"
     $status | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tempFile -Encoding UTF8
-    if (Test-Path -LiteralPath $WatchdogStatusFile) {
-        [IO.File]::Replace($tempFile, $WatchdogStatusFile, [NullString]::Value)
-    }
-    else {
-        [IO.File]::Move($tempFile, $WatchdogStatusFile)
+    for ($attempt = 1; $attempt -le $StatusWriteMaxAttempts; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $WatchdogStatusFile) {
+                [IO.File]::Replace($tempFile, $WatchdogStatusFile, [NullString]::Value)
+            }
+            else {
+                [IO.File]::Move($tempFile, $WatchdogStatusFile)
+            }
+            if ($attempt -gt 1) {
+                Write-WatchdogLog "Status update recovered on attempt $attempt."
+            }
+            return
+        }
+        catch {
+            $cause = $_.Exception.GetBaseException()
+            $nativeError = $cause.HResult -band 0xffff
+            if ($cause -isnot [IO.IOException] -or $nativeError -notin $StatusWriteRetryableErrors) {
+                throw
+            }
+            if ($attempt -eq $StatusWriteMaxAttempts) {
+                Write-WatchdogLog "Status update failed after $attempt attempts (Win32 $nativeError)."
+                throw
+            }
+            if ($attempt -eq 1) {
+                Write-WatchdogLog "Status update blocked (Win32 $nativeError); retrying: $($cause.Message)"
+            }
+            Start-Sleep -Milliseconds $StatusWriteRetryMilliseconds
+        }
     }
 }
 
