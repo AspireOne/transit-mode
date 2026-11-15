@@ -78,7 +78,7 @@ JSON cause an error before activation changes the system. JSON does not allow co
 | `lidAction` | 0 = do nothing, 1 = sleep, 2 = hibernate, 3 = shut down. |
 | `sleepTimeoutSeconds` | Seconds before idle sleep; 0 = never. |
 | `wakeTimers` | 0 = disabled, 1 = enabled, 2 = important timers only. |
-| `watchdogStartupTimeoutSeconds` | Positive; must exceed the watchdog's `startupGraceSeconds`. |
+| `watchdogStartupTimeoutSeconds` | Positive; must exceed the watchdog's `startupGraceSeconds`. If activation is interrupted, the armed watchdog stops waiting after twice this time. |
 
 Watchdog temperatures are integer degrees Celsius (1–200), with
 `temperatureResetC < sustainedTemperatureC < criticalTemperatureC`.

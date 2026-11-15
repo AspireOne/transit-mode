@@ -18,6 +18,12 @@ $StateDir  = Join-Path $env:ProgramData "TransitMode"
 $StateFile = Join-Path $StateDir "state.json"
 
 $WatchdogTaskName        = "Transit Mode Watchdog"
+# Task Scheduler's default (7) is below normal, with low I/O and memory priority:
+# sustained load, which the watchdog exists to catch, could starve it. 2 = above normal.
+$WatchdogTaskPriority    = 2
+# Task Scheduler COM TASK_STATE values, named like the ScheduledTasks module's.
+$TaskStateNames          = @{ 0 = "Unknown"; 1 = "Disabled"; 2 = "Queued"; 3 = "Ready"; 4 = "Running" }
+$ElevatedOutputPollMilliseconds = 200
 $WatchdogSourceScript    = Join-Path $PSScriptRoot "transit-watchdog.ps1"
 $WatchdogInstalledScript = Join-Path $StateDir "transit-watchdog.ps1"
 $WatchdogStatusFile      = Join-Path $StateDir "watchdog-status.json"
@@ -112,23 +118,12 @@ function Restart-InWindowsPowerShell {
 
     $resultFile = [IO.Path]::GetTempFileName()
     try {
-        $scriptLiteral = "'" + $PSCommandPath.Replace("'", "''") + "'"
-        $resultLiteral = "'" + $resultFile.Replace("'", "''") + "'"
-        $command = @"
-try {
-    & $scriptLiteral $Action *> $resultLiteral
-    exit 0
-} catch {
-    (`$_ | Out-String) + `$_.ScriptStackTrace | Add-Content -LiteralPath $resultLiteral
-    exit 1
-}
-"@
+        $command = New-CapturedCommand -ScriptPath $PSCommandPath -ScriptAction $Action -ResultFile $resultFile
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
         $exe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
         $process = Start-Process -FilePath $exe -Verb RunAs -WindowStyle Hidden `
-            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded" -Wait -PassThru
-        $output = Get-Content -LiteralPath $resultFile -Raw
-        if ($output) { Write-Host $output.TrimEnd() }
+            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded" -PassThru
+        Wait-ProcessOutput -Process $process -Path $resultFile
         if ($process.ExitCode -ne 0) {
             throw "Transit Mode '$Action' failed (exit $($process.ExitCode)). See the error above."
         }
@@ -137,6 +132,53 @@ try {
         Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
     }
     exit 0
+}
+
+function New-CapturedCommand {
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][string]$ScriptAction,
+        [Parameter(Mandatory)][string]$ResultFile
+    )
+
+    $scriptLiteral = "'" + $ScriptPath.Replace("'", "''") + "'"
+    $resultLiteral = "'" + $ResultFile.Replace("'", "''") + "'"
+    # Append with '>>', not Add-Content: Add-Content cannot share the file
+    # with Wait-ProcessOutput, which reads it while this process runs.
+    return @"
+try {
+    & $scriptLiteral $ScriptAction *> $resultLiteral
+    exit 0
+} catch {
+    (`$_ | Out-String) + `$_.ScriptStackTrace >> $resultLiteral
+    exit 1
+}
+"@
+}
+
+function Wait-ProcessOutput {
+    param(
+        [Parameter(Mandatory)][Diagnostics.Process]$Process,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    # Without an early handle, ExitCode can be unavailable after a Start-Process
+    # child exits.
+    $null = $Process.Handle
+    # Relay output while the hidden process runs: 'on' can take tens of seconds.
+    # The reader shares the file with the writer and detects its UTF-16 BOM.
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $reader = [IO.StreamReader]::new($stream, $true)
+    try {
+        while (-not $Process.WaitForExit($ElevatedOutputPollMilliseconds)) {
+            Write-Host -NoNewline $reader.ReadToEnd()
+        }
+        Write-Host -NoNewline $reader.ReadToEnd()
+    }
+    finally {
+        $reader.Dispose()
+    }
 }
 
 function Enter-ControllerLock {
@@ -423,8 +465,10 @@ function Install-PawnIoDriver {
         }
 
         Write-Host "Installing the signed PawnIO v$PawnIoVersion sensor driver..."
-        & $installerFile -install -silent
-        $installerExitCode = $LASTEXITCODE
+        # The installer is a GUI-subsystem program: '&' would return before it
+        # finishes, without setting an exit code.
+        $installer = Start-Process -FilePath $installerFile -ArgumentList "-install", "-silent" -Wait -PassThru
+        $installerExitCode = $installer.ExitCode
 
         if ($installerExitCode -eq 3010) {
             throw "PawnIO installed successfully, but Windows requires a restart. Restart, then run 'transit-mode diagnose' again."
@@ -501,14 +545,34 @@ function Get-StateHibernateWasEnabled {
     return [bool]$property.Value
 }
 
+function Get-TaskSchedulerRootFolder {
+    # COM avoids importing the ScheduledTasks module, which takes over a second
+    # in Windows PowerShell.
+    $scheduler = New-Object -ComObject Schedule.Service
+    $scheduler.Connect()
+    return $scheduler.GetFolder("\")
+}
+
 function Get-WatchdogTask {
-    return Get-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
+    try {
+        $task = (Get-TaskSchedulerRootFolder).GetTask($WatchdogTaskName)
+    }
+    catch {
+        if ($_.Exception.GetBaseException() -is [IO.FileNotFoundException]) {
+            return $null
+        }
+        throw
+    }
+
+    $stateName = $TaskStateNames[[int]$task.State]
+    if ($null -eq $stateName) {
+        throw "Unknown watchdog task state '$($task.State)'."
+    }
+    return [pscustomobject]@{ State = $stateName }
 }
 
 function Grant-WatchdogTaskReadAccess {
-    $scheduler = New-Object -ComObject Schedule.Service
-    $scheduler.Connect()
-    $task = $scheduler.GetFolder("\").GetTask($WatchdogTaskName)
+    $task = (Get-TaskSchedulerRootFolder).GetTask($WatchdogTaskName)
     # Task Scheduler can return a noncanonical DACL. Preserve its entries and
     # ordering: CommonSecurityDescriptor.AddAccess refuses to edit such ACLs.
     $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new(
@@ -564,7 +628,7 @@ function Start-Watchdog {
 
     $powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
     $taskArguments =
-        "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WatchdogInstalledScript`" run -ExpectedScheme $TransitScheme"
+        "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WatchdogInstalledScript`" run -ExpectedScheme $TransitScheme -ControllerTimeoutSeconds $WatchdogStartupTimeout"
 
     $taskAction = New-ScheduledTaskAction `
         -Execute $powerShellExe `
@@ -581,6 +645,7 @@ function Start-Watchdog {
         -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -Hidden `
         -MultipleInstances IgnoreNew `
+        -Priority $WatchdogTaskPriority `
         -RestartCount 3 `
         -RestartInterval (New-TimeSpan -Minutes 1) `
         -StartWhenAvailable
@@ -755,6 +820,7 @@ switch ($Action) {
         }
         Save-State $state
 
+        $committed = $false
         try {
             Invoke-PowerCfg -PowerArgs @("/duplicatescheme", $originalScheme, $transitScheme) | Out-Null
 
@@ -780,30 +846,33 @@ switch ($Action) {
 
             $state.Status = "active"
             Save-State $state
-
-            Write-Host ""
-            Write-Host "Transit Mode: ON" -ForegroundColor Green
-            Write-Host "  CPU min state  -> $CpuMinPercent%"
-            Write-Host "  CPU max state  -> $CpuMaxPercent%"
-            Write-Host "  CPU EPP        -> $CpuEppPercent"
-            Write-Host "  CPU boost mode -> $CpuBoostMode (0 = disabled)"
-            Write-Host "  Lid action     -> $LidAction (0 = do nothing)"
-            Write-Host "  Idle sleep     -> $SleepTimeout seconds (0 = never)"
-            Write-Host "  Wake timers    -> $WakeTimers (0 = disabled)"
-            Write-Host "  Watchdog       -> $($watchdogStatus.CpuTemperatureC) C"
-            Write-Host "  Sensor driver  -> PawnIO v$pawnIoInstalledVersion"
-            Write-Host "  Hibernates     -> $($watchdogStatus.SustainedLimitC) C hot band for $($watchdogStatus.SustainedSeconds) s / $($watchdogStatus.CriticalLimitC) C immediately / sensor missing $($watchdogStatus.SensorFailureGrace) s"
-            Write-Host ""
-            Write-Host "Original scheme preserved: $originalScheme"
+            $committed = $true
         }
-        catch {
-            $activationError = $_
-            try { Restore-TransitSession -State $state }
-            catch {
-                Write-Warning "Automatic rollback was incomplete: $($_.Exception.Message). Recovery state retained at: $StateFile"
+        finally {
+            # Roll back in 'finally', not 'catch': Ctrl+C skips catch blocks, and
+            # would otherwise leave an armed watchdog waiting for activation.
+            if (-not $committed) {
+                try { Restore-TransitSession -State $state }
+                catch {
+                    Write-Warning "Automatic rollback was incomplete: $($_.Exception.Message). Recovery state retained at: $StateFile"
+                }
             }
-            throw $activationError
         }
+
+        Write-Host ""
+        Write-Host "Transit Mode: ON" -ForegroundColor Green
+        Write-Host "  CPU min state  -> $CpuMinPercent%"
+        Write-Host "  CPU max state  -> $CpuMaxPercent%"
+        Write-Host "  CPU EPP        -> $CpuEppPercent"
+        Write-Host "  CPU boost mode -> $CpuBoostMode (0 = disabled)"
+        Write-Host "  Lid action     -> $LidAction (0 = do nothing)"
+        Write-Host "  Idle sleep     -> $SleepTimeout seconds (0 = never)"
+        Write-Host "  Wake timers    -> $WakeTimers (0 = disabled)"
+        Write-Host "  Watchdog       -> $($watchdogStatus.CpuTemperatureC) C"
+        Write-Host "  Sensor driver  -> PawnIO v$pawnIoInstalledVersion"
+        Write-Host "  Hibernates     -> $($watchdogStatus.SustainedLimitC) C hot band for $($watchdogStatus.SustainedSeconds) s / $($watchdogStatus.CriticalLimitC) C immediately / sensor missing $($watchdogStatus.SensorFailureGrace) s"
+        Write-Host ""
+        Write-Host "Original scheme preserved: $originalScheme"
     }
 
     "off" {
@@ -907,15 +976,15 @@ switch ($Action) {
             $diagnosticLines += "  PawnIO sensor driver: v$pawnIoInstalledVersion (installed)"
             $diagnosticLines += "  Hibernation currently available: $(Test-HibernationAvailable)"
             $diagnosticLines += @(& $WatchdogSourceScript probe)
-            $diagnosticLines | Set-Content -LiteralPath $DiagnosticFile -Encoding UTF8
-            $diagnosticLines | ForEach-Object { Write-Host $_ }
         }
         catch {
             $diagnosticLines += "  FAILED: $($_.Exception.Message)"
-            if (Test-Path -LiteralPath $StateDir) {
-                $diagnosticLines | Set-Content -LiteralPath $DiagnosticFile -Encoding UTF8
-            }
             throw
+        }
+        finally {
+            # Show and keep partial results too: they identify the failing step.
+            $diagnosticLines | Set-Content -LiteralPath $DiagnosticFile -Encoding UTF8
+            $diagnosticLines | ForEach-Object { Write-Host $_ }
         }
     }
 }

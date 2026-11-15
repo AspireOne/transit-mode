@@ -176,7 +176,11 @@ Describe "Watchdog installation and recovery" {
         (Read-TransitConfig $WatchdogInstalledConfig watchdog).criticalTemperatureC | Should Be 86
         (Read-TransitConfig $WatchdogInstalledConfig watchdog).lowBatteryPercent | Should Be 9
         Test-Path $WatchdogInstalledScript | Should Be $true
-        Assert-MockCalled Register-ScheduledTask -Times 1 -Exactly
+        Assert-MockCalled Register-ScheduledTask -Times 1 -Exactly -ParameterFilter {
+            # Above normal, so sustained load cannot starve the watchdog.
+            $Settings.Priority -eq 2 -and
+                $Action.Arguments -match " run -ExpectedScheme test-scheme -ControllerTimeoutSeconds 40$"
+        }
         Assert-MockCalled Grant-WatchdogTaskReadAccess -Times 1 -Exactly
     }
 

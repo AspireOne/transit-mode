@@ -7,7 +7,11 @@ param(
     [ValidateSet("run", "probe")]
     [string]$Action,
 
-    [string]$ExpectedScheme
+    [string]$ExpectedScheme,
+
+    # The controller's watchdogStartupTimeoutSeconds: it activates Transit, or
+    # rolls back, within this time of the worker reporting "armed".
+    [int]$ControllerTimeoutSeconds
 )
 
 Set-StrictMode -Version Latest
@@ -35,6 +39,9 @@ $StatusWriteRetryMilliseconds = 100
 # Win32 sharing violation, lock violation, and unable to remove replaced file.
 # These leave both file names intact, so retrying the atomic replacement is safe.
 $StatusWriteRetryableErrors = @(32, 33, 1175)
+
+# Margin over the controller's own timeout before an armed worker gives up.
+$ArmedDeadlineFactor = 2
 
 function Write-WatchdogLog {
     param([Parameter(Mandatory)][string]$Message)
@@ -285,6 +292,20 @@ function Read-CpuTemperature {
 }
 
 function Get-ActiveSchemeGuid {
+    try {
+        # Runs every poll (and 4 times a second while armed): a native call avoids
+        # starting powercfg.exe each time.
+        return Read-ActivePowerScheme
+    }
+    catch {
+        # Emergency restoration verifies the plan through this function, so a
+        # broken native layer must not also break recovery.
+        Write-WatchdogLog "Native active-plan query failed; using powercfg: $($_.Exception.Message)"
+        return Get-ActiveSchemeGuidFromPowerCfg
+    }
+}
+
+function Get-ActiveSchemeGuidFromPowerCfg {
     $output = & powercfg.exe /getactivescheme 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "powercfg /getactivescheme failed: $(($output | Out-String).Trim())"
@@ -451,6 +472,20 @@ public static class TransitModeWatchdogNativePower
         finally { CloseHandle(token); }
     }
 
+    [DllImport("powrprof.dll")]
+    static extern uint PowerGetActiveScheme(IntPtr userRootPowerKey, out IntPtr activePolicyGuid);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr LocalFree(IntPtr memory);
+
+    public static Guid GetActiveScheme()
+    {
+        IntPtr guidPointer;
+        uint error = PowerGetActiveScheme(IntPtr.Zero, out guidPointer);
+        if (error != 0) throw new Win32Exception((int)error);
+        try { return (Guid)Marshal.PtrToStructure(guidPointer, typeof(Guid)); }
+        finally { LocalFree(guidPointer); }
+    }
+
     [DllImport("powrprof.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.U1)]
     public static extern bool SetSuspendState(
@@ -468,6 +503,12 @@ function Read-SystemPowerStatus {
         throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())
     }
     return $status
+}
+
+function Read-ActivePowerScheme {
+    Initialize-NativePowerApi
+    # Guid.ToString() is lowercase, matching the powercfg-based fallback.
+    return [TransitModeWatchdogNativePower]::GetActiveScheme().ToString()
 }
 
 function Get-LowBatteryReason {
@@ -592,6 +633,12 @@ if ($Action -eq "run") {
     if (-not [guid]::TryParse($ExpectedScheme, [ref]$expectedSchemeGuid)) {
         throw "ExpectedScheme is not a valid GUID."
     }
+    if ($ControllerTimeoutSeconds -le 0) {
+        throw "ControllerTimeoutSeconds must be a positive number of seconds."
+    }
+    # Staying armed this long means the controller stopped before it activated
+    # Transit or rolled back (for example, it crashed, was killed, or the system restarted).
+    $ArmedDeadlineSeconds = $ArmedDeadlineFactor * [double]$ControllerTimeoutSeconds
 }
 
 $computer = $null
@@ -679,6 +726,15 @@ try {
         }
         if ($phase -eq "armed") {
             if ($null -eq $reading) { throw "CPU sensor unavailable while arming the watchdog." }
+            if ($now -ge $ArmedDeadlineSeconds) {
+                # The original plan is active, so stopping is safe. A controller that
+                # activates later sees this failure and rolls back. Exit 0: a
+                # Task Scheduler restart would only wait again.
+                $reason = "Transit Mode was not activated within $ArmedDeadlineSeconds seconds of the watchdog starting; activation was interrupted. The original plan remains active. Run 'transit-mode off' to clean up."
+                Write-WatchdogLog $reason
+                Write-WatchdogStatus -State "failed" -Reason $reason
+                return
+            }
             Write-WatchdogStatus -State "armed" -CpuTemperatureC $reading.MaximumC -Sensors $reading.Sensors
             Start-Sleep -Milliseconds 250
             continue

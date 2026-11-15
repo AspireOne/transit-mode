@@ -46,6 +46,10 @@ function Read-SystemPowerStatus {
     }
     return [pscustomobject]@{ ACLineStatus = 1; BatteryFlag = 0; BatteryLifePercent = 100 }
 }
+function Read-ActivePowerScheme {
+    if ($script:case -eq "native-scheme-failure") { throw "Injected native scheme failure" }
+    return $script:activePlan
+}
 function powercfg.exe {
     param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
     $global:LASTEXITCODE = 0
@@ -91,7 +95,7 @@ function Start-Sleep {
         }
     }
 }
-if ($script:case -in @("armed", "stopped")) {
+if ($script:case -in @("armed", "armed-abandoned", "stopped")) {
     $script:activePlan = "11111111-1111-1111-1111-111111111111"
 }
 '@
@@ -100,12 +104,18 @@ if ($script:case -in @("armed", "stopped")) {
         @{
             Status = "active"; TransitScheme = $transit; OriginalScheme = $original
         } | ConvertTo-Json | Set-Content (Join-Path $sandbox "state.json")
+
+        function Invoke-Worker {
+            param([int]$ControllerTimeoutSeconds = 40)
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") `
+                run -ExpectedScheme $transit -ControllerTimeoutSeconds $ControllerTimeoutSeconds
+        }
     }
 
     It "continues monitoring after a reader briefly blocks atomic status replacement" {
         Set-Content (Join-Path $sandbox "case.txt") "status-transient"
 
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
 
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
@@ -121,7 +131,7 @@ if ($script:case -in @("armed", "stopped")) {
     It "restores and hibernates after bounded retries even if emergency status is also locked" {
         Set-Content (Join-Path $sandbox "case.txt") "status-persistent"
 
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
 
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
@@ -144,7 +154,7 @@ if ($script:case -in @("armed", "stopped")) {
         @{ ACLineStatus = 0; BatteryFlag = 4; BatteryLifePercent = $Percent } |
             ConvertTo-Json | Set-Content (Join-Path $sandbox "power-status.json")
 
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
 
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
@@ -170,7 +180,7 @@ if ($script:case -in @("armed", "stopped")) {
         @{ ACLineStatus = $AC; BatteryFlag = $Flag; BatteryLifePercent = $Percent } |
             ConvertTo-Json | Set-Content (Join-Path $sandbox "power-status.json")
 
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
 
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
@@ -188,7 +198,7 @@ if ($script:case -in @("armed", "stopped")) {
         @{ ACLineStatus = 0; BatteryFlag = 255; BatteryLifePercent = 10 } |
             ConvertTo-Json | Set-Content (Join-Path $sandbox "power-status.json")
 
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
 
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
@@ -202,7 +212,7 @@ if ($script:case -in @("armed", "stopped")) {
     It "restores and hibernates if the Windows power-status call fails" {
         Set-Content (Join-Path $sandbox "case.txt") "battery-failure"
 
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
 
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
@@ -214,7 +224,7 @@ if ($script:case -in @("armed", "stopped")) {
 
     It "restores the original plan before emergency hibernation and exits safely after resume" {
         Set-Content (Join-Path $sandbox "case.txt") "critical"
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
         $events[0] | Should Be "restored"
@@ -224,7 +234,7 @@ if ($script:case -in @("armed", "stopped")) {
 
     It "retries protection after resume if original-plan restoration failed" {
         Set-Content (Join-Path $sandbox "case.txt") "restore-retry"
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
         $events[0] | Should Be "hibernate:$transit"
@@ -234,7 +244,7 @@ if ($script:case -in @("armed", "stopped")) {
 
     It "restores the plan before the shutdown.exe hibernation fallback" {
         Set-Content (Join-Path $sandbox "case.txt") "fallback"
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
         $events[0] | Should Be "restored"
@@ -247,7 +257,7 @@ if ($script:case -in @("armed", "stopped")) {
         $state.Status = "activating"
         $state | ConvertTo-Json | Set-Content $statePath
         Set-Content (Join-Path $sandbox "case.txt") "armed"
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
         $LASTEXITCODE | Should Be 0
         $events = @(Get-Content (Join-Path $sandbox "events.txt"))
         $events[0] | Should Be "armed"
@@ -255,10 +265,43 @@ if ($script:case -in @("armed", "stopped")) {
         $events.Count | Should Be 2
     }
 
+    It "stops waiting for an interrupted activation without touching the original plan" {
+        $statePath = Join-Path $sandbox "state.json"
+        $state = Get-Content $statePath -Raw | ConvertFrom-Json
+        $state.Status = "activating"
+        $state | ConvertTo-Json | Set-Content $statePath
+        Set-Content (Join-Path $sandbox "case.txt") "armed-abandoned"
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+
+        Invoke-Worker -ControllerTimeoutSeconds 1
+
+        $LASTEXITCODE | Should Be 0
+        # The worker allows twice the controller's timeout, on its own clock.
+        ($timer.Elapsed.TotalSeconds -ge 2) | Should Be $true
+        Test-Path (Join-Path $sandbox "events.txt") | Should Be $false
+        $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
+        $status.State | Should Be "failed"
+        $status.Reason | Should Match "not activated within 2 seconds"
+    }
+
+    It "monitors and recovers through powercfg if the native active-plan query fails" {
+        Set-Content (Join-Path $sandbox "case.txt") "native-scheme-failure"
+
+        Invoke-Worker
+
+        $LASTEXITCODE | Should Be 0
+        $events = @(Get-Content (Join-Path $sandbox "events.txt"))
+        $events[0] | Should Be "restored"
+        $events[1] | Should Be "hibernate:$original"
+        $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
+        $status.Reason | Should Match "immediate limit"
+        Get-Content (Join-Path $sandbox "watchdog.log") -Raw | Should Match "using powercfg"
+    }
+
     It "does not hibernate an already restored session even with broken config" {
         Set-Content (Join-Path $sandbox "case.txt") "stopped"
         Set-Content (Join-Path $sandbox "transit-watchdog.config.json") '{}'
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
         $LASTEXITCODE | Should Be 0
         Test-Path (Join-Path $sandbox "events.txt") | Should Be $false
     }
@@ -270,7 +313,7 @@ if ($script:case -in @("armed", "stopped")) {
         $config.resumeGapSeconds = 2
         $config | ConvertTo-Json | Set-Content $configPath
         Set-Content (Join-Path $sandbox "case.txt") "gap"
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
         $LASTEXITCODE | Should Be 0
         $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
         $status.Reason | Should Match "monitoring gap"
@@ -284,7 +327,7 @@ if ($script:case -in @("armed", "stopped")) {
         $config.missingSensorGraceSeconds = 1
         $config | ConvertTo-Json | Set-Content $configPath
         Set-Content (Join-Path $sandbox "case.txt") "missing"
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sandbox "worker.ps1") run -ExpectedScheme $transit
+        Invoke-Worker
         $LASTEXITCODE | Should Be 0
         $status = Get-Content (Join-Path $sandbox "watchdog-status.json") -Raw | ConvertFrom-Json
         $status.Reason | Should Match "monitoring was unavailable"
@@ -292,14 +335,21 @@ if ($script:case -in @("armed", "stopped")) {
 }
 
 Describe "Native Windows power status" {
-    It "reads the real power status without changing power settings" {
-        $tokens = $null; $errors = $null
-        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repo "transit-watchdog.ps1"), [ref]$tokens, [ref]$errors)
-        foreach ($name in @("Initialize-NativePowerApi", "Read-SystemPowerStatus")) {
-            $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $false)
-            . ([scriptblock]::Create($function.Extent.Text))
-        }
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repo "transit-watchdog.ps1"), [ref]$tokens, [ref]$errors)
+    foreach ($name in @("Initialize-NativePowerApi", "Read-SystemPowerStatus", "Read-ActivePowerScheme")) {
+        $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $false)
+        . ([scriptblock]::Create($function.Extent.Text))
+    }
 
+    It "reads the real active plan identically to powercfg" {
+        $powerCfgText = (& powercfg.exe /getactivescheme) | Out-String
+        $powerCfgText -match '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | Should Be $true
+
+        Read-ActivePowerScheme | Should BeExactly $Matches[0].ToLowerInvariant()
+    }
+
+    It "reads the real power status without changing power settings" {
         $status = Read-SystemPowerStatus
 
         $status | Should Not BeNullOrEmpty

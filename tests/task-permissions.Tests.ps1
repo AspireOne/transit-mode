@@ -6,12 +6,14 @@ Describe "Watchdog task read access" {
         $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile(
             (Join-Path $repo "transit-mode.ps1"), [ref]$tokens, [ref]$errors)
-        $function = $ast.Find({
-            param($node)
-            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-                $node.Name -eq "Grant-WatchdogTaskReadAccess"
-        }, $true)
-        . ([scriptblock]::Create($function.Extent.Text))
+        foreach ($name in @("Get-TaskSchedulerRootFolder", "Grant-WatchdogTaskReadAccess")) {
+            $function = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq $name
+            }, $true)
+            . ([scriptblock]::Create($function.Extent.Text))
+        }
         $WatchdogTaskName = "Transit Mode Watchdog"
 
         # Only the Task Scheduler COM boundary is replaced; ACL editing is real.
